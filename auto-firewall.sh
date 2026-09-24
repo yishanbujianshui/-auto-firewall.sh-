@@ -167,6 +167,61 @@ build_ufw_args() {
     return 0
 }
 
+#---- 监听扫描 v2（spec §3.1, GAP-2）------------------------------------------
+# 输入 ss/netstat 单行 -> 输出 "port|proto|family"; 回环/无效行返回非0
+# 兼容: ss(Netid=LISTEN/UNCONN) 与 netstat(Proto=tcp/udp/tcp6/udp6) 两种格式
+parse_scan_line() {
+    local line="${1:-}"
+    local -a f
+    read -r -a f <<<"$line"
+    (( ${#f[@]} >= 4 )) || return 1
+
+    local proto
+    case "${f[0]}" in
+        tcp*) proto=tcp ;;
+        udp*) proto=udp ;;
+        LISTEN) proto=tcp ;;
+        UNCONN) proto=udp ;;
+        *) return 1 ;;
+    esac
+
+    # 取第一个以 ":数字" 结尾的字段 = Local Address:Port
+    local fld addr=""
+    for fld in "${f[@]}"; do
+        if [[ "$fld" =~ :[0-9]+$ ]]; then addr="$fld"; break; fi
+    done
+    [[ -n "$addr" ]] || return 1
+
+    local port="${addr##*:}"
+    local ip="${addr%:*}"
+    ip="${ip#\[}"; ip="${ip%\]}"      # 去 IPv6 方括号
+    ip="${ip%%%*}"                     # 去 zone id (fe80::1%eth0 -> fe80::1)
+    [[ "$port" =~ ^[0-9]+$ ]] || return 1
+
+    local fam
+    case "$ip" in
+        127.0.0.1|::1)  return 1 ;;    # 回环不纳入动态管理
+        \*)             fam="all" ;;
+        0.0.0.0)        fam="4" ;;
+        ::)             fam="6" ;;
+        fe80:*)         fam="6" ;;     # link-local 仅记录
+        *:*:*)          fam="6" ;;     # 多段冒号 -> IPv6
+        *)              fam="4" ;;
+    esac
+    echo "${port}|${proto}|${fam}"
+}
+
+# 采集监听原始行（经 ss_probe/netstat_probe 封装, 便于测试桩入）
+ss_listen_raw() {
+    if command -v ss &>/dev/null; then
+        { ss_probe -tln; ss_probe -uln; }
+    elif command -v netstat &>/dev/null; then
+        netstat_probe -tuln
+    else
+        return 1
+    fi
+}
+
 check_root() {
     if [[ $EUID -ne 0 ]]; then
         echo "错误: 此脚本必须以 root 身份执行，请使用 sudo。" >&2
