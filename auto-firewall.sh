@@ -570,27 +570,29 @@ config_edit() {
 }
 
 # config 子命令分发（main 传入 CMD_ARGS[1..]）
+# 注: case 分支中函数失败不会自动传播退出码(bash 语义), 必须显式 rc=$? 捕获
 config_main() {
-    local sub="${1:-list}"; shift || true
+    local sub="${1:-list}" rc=0; shift || true
     case "$sub" in
         add)
             [[ -z "${1:-}" || -z "${2:-}" ]] && { _err "用法: config add port|ip <值>"; return 1; }
             case "$1" in
-                port) config_add_port "$2" ;;
-                ip)   config_add_ip "$2" ;;
+                port) config_add_port "$2" || rc=$? ;;
+                ip)   config_add_ip "$2" || rc=$? ;;
                 *)    _err "未知类型: $1（port|ip）"; return 1 ;;
             esac ;;
         del)
             [[ -z "${1:-}" || -z "${2:-}" ]] && { _err "用法: config del port|ip <值>"; return 1; }
             case "$1" in
-                port) config_del_port "$2" ;;
-                ip)   config_del_ip "$2" ;;
+                port) config_del_port "$2" || rc=$? ;;
+                ip)   config_del_ip "$2" || rc=$? ;;
                 *)    _err "未知类型: $1（port|ip）"; return 1 ;;
             esac ;;
-        list) config_list "${1:-ports}" ;;
-        edit) config_edit "${1:-ports}" ;;
+        list) config_list "${1:-ports}" || rc=$? ;;
+        edit) config_edit "${1:-ports}" || rc=$? ;;
         *)    _err "未知 config 子命令: $sub"; return 1 ;;
     esac
+    return "$rc"
 }
 
 #---- 恢复默认 / 手动封禁 / 版本 / 日志（spec §7.2/§7.3/§9）----------------
@@ -1725,36 +1727,38 @@ parse_args() {
 main() {
     parse_args "$@"
     local cmd="${CMD_ARGS[0]:-help}"
+    local rc=0
 
     # 这些命令需要 root
     case "$cmd" in
-        install|port-check|cleanup|fail2ban-check|config|reset-config|uninstall|ban|unban)
+        install|port-check|cleanup|fail2ban-check|config|reset-config|uninstall|ban|unban|menu)
             check_root
             init_dirs
             ;;
     esac
 
+    # 注: 子命令失败需用 `|| rc=$?` 显式捕获, case 分支不会自动传播退出码
     case "$cmd" in
-        install)        do_install ;;
-        port-check)     port_check ;;
-        fail2ban-check) fail2ban_check ;;
-        cleanup)        cleanup ;;
-        status)         show_status ;;
+        install)        do_install || rc=$? ;;
+        port-check)     port_check || rc=$? ;;
+        fail2ban-check) fail2ban_check || rc=$? ;;
+        cleanup)        cleanup || rc=$? ;;
+        status)         show_status || rc=$? ;;
         menu)
             if command -v dialog &>/dev/null && [[ -t 1 ]]; then
                 ensure_locale_utf8
-                tui_menu
+                tui_menu || rc=$?
             else
                 _info "dialog 不可用或非交互终端, 降级为文本帮助"
                 show_help
             fi ;;
-        config)         config_main "${CMD_ARGS[@]:1}" ;;
-        reset-config)   reset_config "${CMD_ARGS[1]:-all}" ;;
-        ban)            ban_ip "${CMD_ARGS[1]:-}" "${CMD_ARGS[2]:-}" ;;
-        unban)          unban_ip "${CMD_ARGS[1]:-}" ;;
-        version)        show_version ;;
-        log)            show_log "${CMD_ARGS[1]:-100}" ;;
-        uninstall)      uninstall ;;
+        config)         config_main "${CMD_ARGS[@]:1}" || rc=$? ;;
+        reset-config)   reset_config "${CMD_ARGS[1]:-all}" || rc=$? ;;
+        ban)            ban_ip "${CMD_ARGS[1]:-}" "${CMD_ARGS[2]:-}" || rc=$? ;;
+        unban)          unban_ip "${CMD_ARGS[1]:-}" || rc=$? ;;
+        version)        show_version || rc=$? ;;
+        log)            show_log "${CMD_ARGS[1]:-100}" || rc=$? ;;
+        uninstall)      uninstall || rc=$? ;;
         help|--help|-h) show_help ;;
         *)
             echo "错误: 未知命令 '$cmd'" >&2
@@ -1762,6 +1766,7 @@ main() {
             exit 1
             ;;
     esac
+    return "$rc"
 }
 
 # 初始化目录（需要 root 的命令调用）

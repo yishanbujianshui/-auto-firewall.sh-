@@ -51,3 +51,9 @@ load test_helper/common
   [ "$ASSUME_YES" = "0" ]
   [ "$PURGE" = "0" ]
 }
+
+@test "CLI: 子命令失败时退出码非0（main case 不吞码回归测试）" {
+  # log 不需 root; 非数字参数使 show_log 失败 -> 全链路传播
+  run bash "${BATS_TEST_DIRNAME}/../auto-firewall.sh" log not-a-number
+  [ "$status" -ne 0 ]
+}
