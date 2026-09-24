@@ -449,6 +449,149 @@ WL_EOF
     _info "IP 白名单文件已生成: $IP_WHITELIST_FILE"
 }
 
+#---- 配置管理 config（spec §7.1, G8/GAP-注入防护）---------------------------
+# IP/CIDR 合法性校验（IPv4 逐段 0-255 + 掩码 0-32; IPv6 宽松字符集 + 掩码 0-128）
+valid_ip_spec() {
+    local v="${1:-}" ip bits
+    [[ -z "$v" || "$v" == /* ]] && return 1
+    ip="${v%%/*}"; bits=""
+    [[ "$v" == */* ]] && bits="${v##*/}"
+    if [[ -n "$bits" ]]; then
+        [[ "$bits" =~ ^[0-9]+$ ]] || return 1
+        if [[ "$ip" == *:* ]]; then (( bits <= 128 )) || return 1
+        else (( bits <= 32 )) || return 1; fi
+    fi
+    if [[ "$ip" == *:* ]]; then
+        [[ "$ip" =~ ^[0-9a-fA-F:]+$ ]] || return 1
+        return 0
+    fi
+    local o
+    local -a oct
+    IFS='.' read -r -a oct <<< "$ip"
+    (( ${#oct[@]} == 4 )) || return 1
+    for o in "${oct[@]}"; do
+        [[ "$o" =~ ^[0-9]{1,3}$ ]] || return 1
+        (( o <= 255 )) || return 1
+    done
+    return 0
+}
+
+# 内置受保护 IP（回环+内网段, 不可删）
+is_protected_ip() {
+    local v="${1:-}"
+    v="${v%%[[:space:]]*}"
+    case "$v" in
+        127.0.0.1/8|::1|10.0.0.0/8|172.16.0.0/12|192.168.0.0/16) return 0 ;;
+        *) return 1 ;;
+    esac
+}
+
+config_add_port() {
+    local k
+    k="$(canon_key "${1:-}")" || { _err "非法端口描述符: ${1:-}"; return 1; }
+    backup_configs >/dev/null || { _err "备份失败, 取消变更"; return 1; }
+    _wl_has_key "$WHITELIST_FILE" "$k" && { _info "已存在: $k"; return 0; }
+    printf '%s  # 手动添加\n' "$k" >> "$WHITELIST_FILE"
+    _info "已加入端口白名单: $k（port-check 或 cron 周期生效）"
+}
+
+# 按首字段匹配条目（行尾可能带注释, grep -x 全行匹配不适用）
+_wl_has_key() {
+    awk -v k="$2" '$1==k{f=1} END{exit f?0:1}' "$1" 2>/dev/null
+}
+
+config_del_port() {
+    local k
+    k="$(canon_key "${1:-}")" || { _err "非法端口描述符: ${1:-}"; return 1; }
+    [[ "${k%%/*}" == "22" ]] && { _err "SSH 端口不可移出白名单"; return 1; }
+    local tmp="${WHITELIST_FILE}.tmp.$$"
+    awk -v k="$k" '$1!=k' "$WHITELIST_FILE" > "$tmp"
+    backup_configs >/dev/null || { rm -f "$tmp"; return 1; }
+    mv "$tmp" "$WHITELIST_FILE"
+    _info "已从端口白名单移除: $k"
+}
+
+config_add_ip() {
+    valid_ip_spec "${1:-}" || { _err "非法 IP/CIDR: ${1:-}"; return 1; }
+    backup_configs >/dev/null || { _err "备份失败, 取消变更"; return 1; }
+    _wl_has_key "$IP_WHITELIST_FILE" "${1%%[[:space:]]*}" && { _info "已存在: $1"; return 0; }
+    printf '%s  # 手动添加\n' "$1" >> "$IP_WHITELIST_FILE"
+    _info "已加入 IP 白名单: $1（fail2ban-check 会同步到 jail.local）"
+}
+
+config_del_ip() {
+    is_protected_ip "${1:-}" && { _err "受保护的默认项, 不可删除: $1"; return 1; }
+    local tmp="${IP_WHITELIST_FILE}.tmp.$$"
+    awk -v k="${1%%[[:space:]]*}" '$1!=k' "$IP_WHITELIST_FILE" > "$tmp"
+    backup_configs >/dev/null || { rm -f "$tmp"; return 1; }
+    mv "$tmp" "$IP_WHITELIST_FILE"
+    _info "已从 IP 白名单移除: $1"
+}
+
+config_list() {
+    case "${1:-ports}" in
+        ports) echo "[端口白名单（canon key）]"; read_whitelist 2>/dev/null | grep -v '^#' || echo "  (空)" ;;
+        ip)    echo "[IP 白名单]"; grep -vE '^[[:space:]]*(#|$)' "$IP_WHITELIST_FILE" 2>/dev/null || echo "  (空)" ;;
+        *)     _err "未知类型: $1（ports|ip）"; return 1 ;;
+    esac
+}
+
+# 整文件文本编辑: $EDITOR 修改临时副本, 保存前逐行校验, 非法行拒写（CLI 严格模式）
+config_edit() {
+    local which="${1:-ports}" file tmp line bad=0 badlist=""
+    case "$which" in
+        ports) file="$WHITELIST_FILE" ;;
+        ip)    file="$IP_WHITELIST_FILE" ;;
+        *)     _err "未知类型: $which"; return 1 ;;
+    esac
+    [[ -f "$file" ]] || { _err "配置文件不存在: $file"; return 1; }
+    [[ -t 1 ]] || { _err "非交互终端, 请用 config add/del"; return 1; }
+    tmp="$(mktemp)"
+    cp "$file" "$tmp"
+    "${EDITOR:-nano}" "$tmp"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        local t="${line#"${line%%[![:space:]]*}"}"
+        [[ -z "$t" || "$t" == \#* ]] && continue
+        if [[ "$which" == "ports" ]]; then
+            canon_key "$line" >/dev/null 2>&1 || { badlist+="${line}"$'\n'; (( bad++ )); }
+        else
+            valid_ip_spec "${t%%[[:space:]]*}" || { badlist+="${line}"$'\n'; (( bad++ )); }
+        fi
+    done < "$tmp"
+    if (( bad )); then
+        _err "发现 ${bad} 条非法行, 未保存:"
+        printf '%s' "$badlist" >&2
+        rm -f "$tmp"; return 1
+    fi
+    backup_configs >/dev/null || { rm -f "$tmp"; return 1; }
+    cat "$tmp" > "$file" && rm -f "$tmp"
+    _info "配置已更新: $file"
+}
+
+# config 子命令分发（main 传入 CMD_ARGS[1..]）
+config_main() {
+    local sub="${1:-list}"; shift || true
+    case "$sub" in
+        add)
+            [[ -z "${1:-}" || -z "${2:-}" ]] && { _err "用法: config add port|ip <值>"; return 1; }
+            case "$1" in
+                port) config_add_port "$2" ;;
+                ip)   config_add_ip "$2" ;;
+                *)    _err "未知类型: $1（port|ip）"; return 1 ;;
+            esac ;;
+        del)
+            [[ -z "${1:-}" || -z "${2:-}" ]] && { _err "用法: config del port|ip <值>"; return 1; }
+            case "$1" in
+                port) config_del_port "$2" ;;
+                ip)   config_del_ip "$2" ;;
+                *)    _err "未知类型: $1（port|ip）"; return 1 ;;
+            esac ;;
+        list) config_list "${1:-ports}" ;;
+        edit) config_edit "${1:-ports}" ;;
+        *)    _err "未知 config 子命令: $sub"; return 1 ;;
+    esac
+}
+
 #---- Fail2ban + Nginx + UFW 集成 ---------------------------------------------
 # 检测 Nginx 日志路径（spec §5: 输出 access 与 error 两行, 供不同 jail 归位）
 detect_nginx_logpath() {
@@ -1259,7 +1402,7 @@ main() {
 
     # 这些命令需要 root
     case "$cmd" in
-        install|port-check|cleanup|fail2ban-check)
+        install|port-check|cleanup|fail2ban-check|config|reset-config|uninstall|ban|unban)
             check_root
             init_dirs
             ;;
@@ -1271,6 +1414,7 @@ main() {
         fail2ban-check) fail2ban_check ;;
         cleanup)        cleanup ;;
         status)         show_status ;;
+        config)         config_main "${CMD_ARGS[@]:1}" ;;
         help|--help|-h) show_help ;;
         *)
             echo "错误: 未知命令 '$cmd'" >&2
