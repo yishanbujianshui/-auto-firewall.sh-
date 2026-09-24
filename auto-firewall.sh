@@ -133,6 +133,40 @@ canon_key() {
     echo "$key"
 }
 
+# 逐 token 打印 ufw 参数（每行一个, 调用方 mapfile 转数组, 防注入）
+# 双栈 tcp/udp 用简写 "<port>/<proto>"; 显式族/portless 用 "proto X from any to Y [port N]"
+# any 协议不生成 proto any（GAP-4）
+build_ufw_args() {
+    local key="$1" action="${2:-allow}"
+    local parsed
+    parsed="$(parse_descriptor "$key")" || return 1
+    local pf pt proto fam
+    IFS='|' read -r pf pt proto fam <<<"$parsed"
+    local port_spec=""
+    if [[ -n "$pf" ]]; then
+        if [[ "$pf" == "$pt" ]]; then port_spec="$pf"; else port_spec="${pf}:${pt}"; fi
+    fi
+    echo "$action"
+    case "$proto" in
+        any)
+            echo "from"; echo "any"; echo "to"; echo "any" ;;
+        tcp|udp)
+            if [[ "$fam" == "all" ]]; then
+                echo "${port_spec}/${proto}"
+            else
+                local dst="0.0.0.0/0"
+                [[ "$fam" == "6" ]] && dst="::/0"
+                echo "proto"; echo "$proto"
+                echo "from"; echo "any"; echo "to"; echo "$dst"
+                echo "port"; echo "$port_spec"
+            fi ;;
+        *)
+            echo "proto"; echo "$proto"
+            echo "from"; echo "any"; echo "to"; echo "any" ;;
+    esac
+    return 0
+}
+
 check_root() {
     if [[ $EUID -ne 0 ]]; then
         echo "错误: 此脚本必须以 root 身份执行，请使用 sudo。" >&2

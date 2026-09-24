@@ -1,60 +1,67 @@
 #!/usr/bin/env bats
-# T3: build_ufw_args 描述符 -> ufw 参数（spec §2.3, GAP-4）
+# T3: build_ufw_args 描述符 -> ufw 参数 token（spec §2.3, GAP-4）
+# 编码约定: 双栈 tcp/udp 简写 "<port>/<proto>"; 显式族/portless 用
+#   "proto <p> from any to <dst>[ port <n>]"; any 无 proto
 
 load test_helper/common
 
-@test "allow 单端口 tcp" {
+# bats $output 为换行连接的标量, 转空格便于整串精确断言
+join() { printf '%s' "${output//$'\n'/ }"; }
+
+@test "allow 单端口 tcp 双栈 -> 简写" {
   run build_ufw_args "22/tcp" allow
   [ "$status" -eq 0 ]
-  [ "${lines[0]}" = "allow" ]
-  [ "${lines[1]}" = "22/tcp" ]
-  [ "${lines[2]}" = "from" ]
-  [ "${lines[3]}" = "any" ]
-  [ "${lines[4]}" = "to" ]
-  [ "${lines[5]}" = "any" ]
-  [ "${#lines[@]}" -eq 6 ]
+  [ "$(join)" = "allow 22/tcp" ]
 }
 
-@test "allow 端口区间" {
+@test "allow 端口区间 双栈 -> 简写" {
   run build_ufw_args "8000:8100/tcp" allow
-  [ "${lines[1]}" = "8000:8100/tcp" ]
+  [ "$(join)" = "allow 8000:8100/tcp" ]
 }
 
-@test "icmp -> proto icmp（GAP-4 不生成 proto any）" {
+@test "v6 -> proto tcp from any to ::/0 port N" {
+  run build_ufw_args "443/tcp/v6" allow
+  [ "$(join)" = "allow proto tcp from any to ::/0 port 443" ]
+}
+
+@test "v4 -> to 0.0.0.0/0" {
+  run build_ufw_args "80/tcp/v4" allow
+  [ "$(join)" = "allow proto tcp from any to 0.0.0.0/0 port 80" ]
+}
+
+@test "v6 区间 -> port start:end" {
+  run build_ufw_args "8000:8100/tcp/v6" allow
+  [ "$(join)" = "allow proto tcp from any to ::/0 port 8000:8100" ]
+}
+
+@test "icmp -> proto icmp, GAP-4 不生成 proto any" {
   run build_ufw_args "-/icmp" allow
-  [[ "${output[*]}" == *"proto icmp"* ]]
-  [[ "${output[*]}" != *"proto any"* ]]
+  [ "$(join)" = "allow proto icmp from any to any" ]
 }
 
 @test "esp 协议名" {
   run build_ufw_args "-/esp" allow
-  [[ "${output[*]}" == *"proto esp"* ]]
+  [ "$(join)" = "allow proto esp from any to any" ]
 }
 
 @test "协议号 50 -> proto 50" {
   run build_ufw_args "-/50" allow
-  [[ "${output[*]}" == *"proto 50"* ]]
+  [ "$(join)" = "allow proto 50 from any to any" ]
 }
 
 @test "any -> 无 proto 无端口（GAP-4）" {
   run build_ufw_args "any" allow
-  [[ "${output[*]}" != *"proto"* ]]
-  [ "${lines[0]}" = "allow" ]
+  [ "$(join)" = "allow from any to any" ]
 }
 
-@test "v6 端口族带 -6 标记" {
-  run build_ufw_args "443/tcp/v6" allow
-  [[ "${output[*]}" == *"-6"* ]]
-}
-
-@test "v4 与 all 相同参数（ufw 默认双栈由 IPV6=yes 保证）" {
-  run build_ufw_args "80/tcp/v4" allow
-  [[ "${output[*]}" != *"-6"* ]]
+@test "udp 双栈简写" {
+  run build_ufw_args "53/udp" allow
+  [ "$(join)" = "allow 53/udp" ]
 }
 
 @test "delete 动作透传" {
   run build_ufw_args "22/tcp" delete
-  [ "${lines[0]}" = "delete" ]
+  [ "$(join)" = "delete 22/tcp" ]
 }
 
 @test "非法 key 返回非0" {
