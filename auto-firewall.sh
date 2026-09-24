@@ -8,17 +8,22 @@
 set -euo pipefail
 
 #---- 全局配置 ----------------------------------------------------------------
-readonly SCRIPT_DIR="/opt/auto-firewall"
-readonly STATE_FILE="${SCRIPT_DIR}/ports.state"
-readonly WHITELIST_FILE="${SCRIPT_DIR}/port-whitelist.conf"
-readonly FIRST_RUN_MARK="${SCRIPT_DIR}/.first_run_done"
-readonly LOG_DIR="${SCRIPT_DIR}/logs"
-readonly LOG_FILE="${LOG_DIR}/auto-firewall.log"
-readonly LOCK_FILE="${SCRIPT_DIR}/.script.lock"
+# 版本与 schema（spec §4.1）
+readonly SCRIPT_VERSION="2.0.0"
+readonly STATE_SCHEMA_VERSION=2
+# 路径基址: 支持 AUTO_FW_HOME 环境变量覆盖（bats 测试隔离用, spec §2.6 GAP-A）
+SCRIPT_DIR="${AUTO_FW_HOME:-/opt/auto-firewall}"
+STATE_FILE="${SCRIPT_DIR}/ports.state"
+WHITELIST_FILE="${SCRIPT_DIR}/port-whitelist.conf"
+FIRST_RUN_MARK="${SCRIPT_DIR}/.first_run_done"
+LOG_DIR="${SCRIPT_DIR}/logs"
+LOG_FILE="${LOG_DIR}/auto-firewall.log"
+LOCK_FILE="${SCRIPT_DIR}/.script.lock"
+IP_WHITELIST_FILE="${SCRIPT_DIR}/ip-whitelist.conf"
+VERSION_FILE="${SCRIPT_DIR}/.schema_version"
 readonly MAX_LOG_SIZE=$((1024 * 1024))       # 日志超过1MB自动截断
 readonly LOG_RETAIN_LINES=500                 # 截断后保留最后500行
 readonly MEM_FREE_THRESHOLD=20                # 空闲内存低于此百分比才释放缓存
-readonly IP_WHITELIST_FILE="${SCRIPT_DIR}/ip-whitelist.conf"
 readonly FAIL2BAN_JAIL_CONF="/etc/fail2ban/jail.local"
 readonly FAIL2BAN_FILTER_DIR="/etc/fail2ban/filter.d"
 readonly FAIL2BAN_ACTION_DIR="/etc/fail2ban/action.d"
@@ -26,13 +31,43 @@ readonly F2B_BANTIME=3600                     # 封禁时长（秒），默认1�
 readonly F2B_FINDTIME=600                     # 统计窗口（秒），默认10分钟
 readonly F2B_MAXRETRY=5                       # 最大重试次数
 
-# 脚本自身路径（适配软链接）
-readonly SCRIPT_PATH="$(readlink -f "$0")"
+# 脚本自身路径（适配软链接; 被 source 时取 BASH_SOURCE）
+SCRIPT_PATH="$(readlink -f "${BASH_SOURCE[0]}")"
 
 #---- 工具函数 ----------------------------------------------------------------
 _log()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE" || true; }
 _err()  { _log "[ERROR] $*" >&2; }
 _info() { _log "[INFO]  $*"; }
+
+# 强制 UTF-8 locale，保 dialog/日志中文不乱码（spec GAP-3）
+ensure_locale_utf8() {
+    case "${LC_ALL:-${LANG:-}}" in
+        *[Uu][Tt][Ff]*8*) : ;;
+        *)
+            if locale -a 2>/dev/null | grep -qiE '^C\.UTF-?8$'; then
+                export LC_ALL=C.UTF-8
+            else
+                _err "未检测到 UTF-8 locale，中文可能乱码；建议执行: dpkg-reconfigure locales"
+            fi ;;
+    esac
+}
+
+#---- 外部命令薄封装（便于 bats 通过 PATH 桩/函数覆盖注入, spec §2.6）--------
+ss_probe()      { ss "$@" 2>/dev/null; }
+netstat_probe() { netstat "$@" 2>/dev/null; }
+apt_exec()      { command apt-get "$@"; }
+# 变更类命令统一入口: dry-run 只记录不执行（spec §5 GAP-5）
+run_cmd() {
+    if [[ "${DRY_RUN:-0}" == "1" ]]; then
+        _log "[DRYRUN] $*"
+        return 0
+    fi
+    "$@"
+}
+ufw_exec()      { run_cmd ufw "$@"; }
+fail2ban_exec() { run_cmd fail2ban-client "$@"; }
+# 服务管理封装（systemctl 优先, 回退 service）
+svc_exec()      { systemctl "$@" 2>&1 || service "$@" 2>&1 || true; }
 
 check_root() {
     if [[ $EUID -ne 0 ]]; then
@@ -57,7 +92,7 @@ detect_port_scanner() {
         echo "netstat"
     else
         _err "未找到 ss 或 netstat 命令，正在安装 iproute2..."
-        apt-get update -qq && apt-get install -y -qq iproute2
+        apt_exec update -qq && apt_exec install -y -qq iproute2
         if command -v ss &>/dev/null; then
             echo "ss"
         else
@@ -170,7 +205,7 @@ init_fail2ban() {
     # 1. 安装 fail2ban
     if ! command -v fail2ban-client &>/dev/null; then
         _info "fail2ban 未安装，正在安装..."
-        apt-get update -qq && apt-get install -y -qq fail2ban
+        apt_exec update -qq && apt_exec install -y -qq fail2ban
     fi
 
     # 2. 初始化 IP 白名单文件
@@ -385,7 +420,7 @@ init_ufw() {
     # 安装 ufw
     if ! command -v ufw &>/dev/null; then
         _info "ufw 未安装，正在安装..."
-        apt-get update -qq && apt-get install -y -qq ufw
+        apt_exec update -qq && apt_exec install -y -qq ufw
     fi
 
     # 重置到干净状态并启用
@@ -708,8 +743,8 @@ cleanup() {
 
     # 1. APT 包管理缓存清理
     if command -v apt-get &>/dev/null; then
-        apt-get clean &>/dev/null || true
-        apt-get autoremove --purge -y &>/dev/null || true
+        apt_exec clean &>/dev/null || true
+        apt_exec autoremove --purge -y &>/dev/null || true
         _info "APT 缓存已清理。"
     fi
 
@@ -977,4 +1012,7 @@ init_dirs() {
     touch "$LOG_FILE" 2>/dev/null || true
 }
 
-main "$@"
+# 仅在直接执行时进入分发; 被 bats source 时不运行（spec §10.1）
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
