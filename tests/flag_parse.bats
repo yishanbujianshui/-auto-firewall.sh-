@@ -38,10 +38,11 @@ load test_helper/common
   [ "$ASSUME_YES" = "1" ]
 }
 
-@test "DRY_RUN 置 1 时导出环境变量供子进程用" {
+@test "DRY_RUN=1 时导出环境变量供子进程与 run_cmd 使用" {
   parse_args port-check --dry-run
   [ "$DRY_RUN" = "1" ]
-  bash -c '[[ "$(run_cmd echo x 2>/dev/null; echo $?)" == "0" ]]'
+  run bash -c 'echo ${DRY_RUN:-unset}'
+  [ "$output" = "1" ]
 }
 
 @test "重复调用会重置上次的 flag" {

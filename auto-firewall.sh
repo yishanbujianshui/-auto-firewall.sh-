@@ -1078,8 +1078,33 @@ do_install() {
 }
 
 #---- 入口 --------------------------------------------------------------------
+# 全局 flag 状态（parse_args 填充, spec §9 G6）
+DRY_RUN="${AUTO_FW_DRYRUN:-0}"
+ASSUME_YES=0
+PURGE=0
+FORCE_SSH=0
+declare -a CMD_ARGS=()
+
+# 剥离全局 flag（可在子命令前/后/中）, 剩余 positional 存入 CMD_ARGS
+parse_args() {
+    CMD_ARGS=()
+    DRY_RUN="${AUTO_FW_DRYRUN:-0}"; ASSUME_YES=0; PURGE=0; FORCE_SSH=0
+    local a
+    for a in "$@"; do
+        case "$a" in
+            --dry-run)   DRY_RUN=1 ;;
+            --yes|-y)    ASSUME_YES=1 ;;
+            --purge)     PURGE=1 ;;
+            --force-ssh) FORCE_SSH=1 ;;
+            *)           CMD_ARGS+=("$a") ;;
+        esac
+    done
+    if [[ "$DRY_RUN" == "1" ]]; then export DRY_RUN; fi
+}
+
 main() {
-    local cmd="${1:-help}"
+    parse_args "$@"
+    local cmd="${CMD_ARGS[0]:-help}"
 
     # 这些命令需要 root
     case "$cmd" in
