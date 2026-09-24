@@ -419,13 +419,14 @@ read_ip_whitelist() {
     fi
 }
 
-# 生成默认 IP 白名单文件
+# 生成默认 IP 白名单文件（--force 覆盖, spec §7.2 前置改造）
 init_ip_whitelist() {
-    if [[ -f "$IP_WHITELIST_FILE" ]]; then
+    if [[ -f "$IP_WHITELIST_FILE" && "${1:-}" != "--force" ]]; then
         _info "IP 白名单文件已存在: $IP_WHITELIST_FILE"
         return 0
     fi
     cat > "$IP_WHITELIST_FILE" <<'WL_EOF'
+# schema-version: 2
 # ============================================
 # 防火墙自动脚本 - IP 白名单配置
 # 
@@ -590,6 +591,84 @@ config_main() {
         edit) config_edit "${1:-ports}" ;;
         *)    _err "未知 config 子命令: $sub"; return 1 ;;
     esac
+}
+
+#---- 恢复默认 / 手动封禁 / 版本 / 日志（spec §7.2/§7.3/§9）----------------
+# 交互确认: ASSUME_YES 短路; dialog 仅在有 TTY 时; 否则拒绝（G8 安全默认）
+confirm() {
+    local prompt="$1"
+    [[ "${ASSUME_YES:-0}" == "1" ]] && return 0
+    if command -v dialog &>/dev/null && [[ -t 1 ]]; then
+        dialog --title "确认" --yesno "$prompt" 12 60 2>/dev/null
+        return $?
+    fi
+    _err "非交互环境需显式传 --yes 才能执行: ${prompt}"
+    return 1
+}
+
+# 恢复默认配置: 不卸载脚本、不改 schema; ports 靠“当前监听重扫”故不会关掉在用端口
+reset_config() {
+    local scope="${1:-all}"
+    case "$scope" in all|ports|ip|fail2ban) : ;; *) _err "未知范围: $scope（all|ports|ip|fail2ban）"; return 1 ;; esac
+    confirm "确认恢复默认配置（${scope}）? 现有配置将先备份" || { _info "已取消"; return 1; }
+    acquire_lock
+    backup_configs >/dev/null || { _err "备份失败, 中止恢复"; return 1; }
+    case "$scope" in
+        all|ports)
+            generate_whitelist
+            printf '# schema-version: 2\n' > "$STATE_FILE"
+            port_check || _err "重建动态端口时存在错误"
+            ;;
+    esac
+    case "$scope" in
+        all|ip) init_ip_whitelist --force ;;
+    esac
+    case "$scope" in
+        all|fail2ban)
+            rebuild_f2b_jail
+            svc_exec reload fail2ban
+            ;;
+    esac
+    _info "恢复默认完成（scope=${scope}）"
+}
+
+# 手动封禁/解封（spec §7.3）: fail2ban 在线时优先走 jail(尊重 bantime), 否则 ufw 持续 deny
+ban_ip() {
+    local ip="${1:-}" dur="${2:-$F2B_BANTIME}"
+    [[ -n "$ip" ]] || { _err "用法: ban <IP>"; return 1; }
+    valid_ip_spec "${ip%%/*}" || { _err "非法 IP/CIDR: $ip"; return 1; }
+    acquire_lock
+    if svc_active fail2ban && fail2ban_exec set sshd banip "$ip" >/dev/null 2>&1; then
+        _info "已通过 fail2ban 封禁: $ip（参考 bantime=${dur}s）"
+    else
+        ufw_exec insert 1 deny from "$ip" to any comment "auto-firewall-manual" \
+            && _info "已通过 UFW 封禁: $ip（持续至 unban）"
+    fi
+}
+
+unban_ip() {
+    local ip="${1:-}"
+    [[ -n "$ip" ]] || { _err "用法: unban <IP>"; return 1; }
+    valid_ip_spec "${ip%%/*}" || { _err "非法 IP/CIDR: $ip"; return 1; }
+    acquire_lock
+    fail2ban_exec set sshd unbanip "$ip" >/dev/null 2>&1 || true
+    ufw_exec delete deny from "$ip" to any comment "auto-firewall-manual" \
+        && _info "已解封: $ip"
+}
+
+show_version() {
+    echo "auto-firewall.sh  版本: ${SCRIPT_VERSION}  配置schema: ${STATE_SCHEMA_VERSION}"
+    grep '^PRETTY_NAME' /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"' | sed 's/^/系统: /' || true
+    command -v ufw &>/dev/null && echo "ufw: $(ufw --version 2>/dev/null | head -1)" || echo "ufw: 未安装"
+    command -v fail2ban-client &>/dev/null && echo "fail2ban: $(fail2ban-client --version 2>&1 | head -1)" || echo "fail2ban: 未安装"
+    command -v dialog &>/dev/null && echo "dialog: $(dialog --version 2>&1 | head -1)" || echo "dialog: 未安装"
+}
+
+show_log() {
+    local n="${1:-100}"
+    [[ "$n" =~ ^[0-9]+$ ]] || { _err "行数需为数字: $n"; return 1; }
+    [[ -f "$LOG_FILE" ]] || { echo "无日志: $LOG_FILE"; return 0; }
+    tail -n "$n" "$LOG_FILE"
 }
 
 #---- Fail2ban + Nginx + UFW 集成 ---------------------------------------------
@@ -1415,6 +1494,11 @@ main() {
         cleanup)        cleanup ;;
         status)         show_status ;;
         config)         config_main "${CMD_ARGS[@]:1}" ;;
+        reset-config)   reset_config "${CMD_ARGS[1]:-all}" ;;
+        ban)            ban_ip "${CMD_ARGS[1]:-}" "${CMD_ARGS[2]:-}" ;;
+        unban)          unban_ip "${CMD_ARGS[1]:-}" ;;
+        version)        show_version ;;
+        log)            show_log "${CMD_ARGS[1]:-100}" ;;
         help|--help|-h) show_help ;;
         *)
             echo "错误: 未知命令 '$cmd'" >&2
