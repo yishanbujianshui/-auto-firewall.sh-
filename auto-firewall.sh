@@ -750,6 +750,134 @@ uninstall() {
     _info "卸载完成。提示: 系统级 ufw/fail2ban 仍在生效（封禁未停止）, 如需一并停用请改用 uninstall --purge（GAP-D）"
 }
 
+#---- 图形化管理界面 TUI（spec §6.3; 仅前端, 业务逻辑全部复用既有函数）------
+ufw_read() { ufw "$@" 2>/dev/null; }    # 只读查询, 不经 run_cmd
+
+tui_msg()  { dialog --backtitle "auto-firewall v${SCRIPT_VERSION}" --title "$1" --msgbox "$2" 18 72 2>/dev/null; }
+tui_input(){ dialog --title "$1" --inputbox "$2" 10 60 3>&1 1>&2 2>&3; }
+tui_dlg()  { dialog --clear --backtitle "auto-firewall v${SCRIPT_VERSION}" "$@" 3>&1 1>&2 2>&3; }
+
+# 编辑对话框 + 逐行校验 + 非法行处理（spec §7.1 交互约定）
+tui_edit_file() {
+    local which="${1:-ports}" file tmp out line t bad=0 badlist=""
+    case "$which" in ports) file="$WHITELIST_FILE" ;; ip) file="$IP_WHITELIST_FILE" ;; *) return 1 ;; esac
+    tmp="$(mktemp)"
+    cat "$file" > "$tmp"
+    if ! out="$(tui_dlg --title "编辑 ${file}（保存前逐行校验）" --editbox "$tmp" 20 76)"; then
+        rm -f "$tmp"; return 0
+    fi
+    rm -f "$tmp"
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        t="${line#"${line%%[![:space:]]*}"}"
+        [[ -z "$t" || "$t" == \#* ]] && continue
+        if [[ "$which" == "ports" ]]; then
+            canon_key "$line" >/dev/null 2>&1 || { bad=$((bad+1)); badlist+="${line}"$'\n'; }
+        else
+            valid_ip_spec "${t%%[[:space:]]*}" || { bad=$((bad+1)); badlist+="${line}"$'\n'; }
+        fi
+    done <<<"$out"
+    if (( bad )); then
+        if dialog --title "校验" --yesno "发现 ${bad} 条非法行:\n${badlist}\n忽略非法行并保存?" 16 70 2>/dev/null; then
+            backup_configs >/dev/null || return 1
+            local kept=""
+            while IFS= read -r line || [[ -n "$line" ]]; do
+                t="${line#"${line%%[![:space:]]*}"}"
+                if [[ -z "$t" || "$t" == \#* ]]; then kept+="${line}"$'\n'; continue; fi
+                if [[ "$which" == "ports" ]]; then
+                    canon_key "$line" >/dev/null 2>&1 && kept+="${line}"$'\n'
+                else
+                    valid_ip_spec "${t%%[[:space:]]*}" && kept+="${line}"$'\n'
+                fi
+            done <<<"$out"
+            printf '%s' "$kept" > "$file"
+            tui_msg "已保存（非法行已丢弃）" "$file"
+        else
+            tui_msg "已放弃" "修改未保存"
+        fi
+    else
+        backup_configs >/dev/null || return 1
+        printf '%s\n' "$out" > "$file"
+        tui_msg "已保存" "$file"
+    fi
+}
+
+tui_config() {
+    local choice v out
+    while true; do
+        choice="$(tui_dlg --title "配置管理" --menu "v2 语法: 22/tcp, 8000:8100/tcp, 443/tcp/v6, icmp" 14 70 7 \
+            1 "添加端口白名单" 2 "删除端口白名单" 3 "添加 IP 白名单" 4 "删除 IP 白名单" \
+            5 "查看当前白名单" 6 "编辑端口白名单文件" 7 "编辑 IP 白名单文件" q "返回主菜单")" || return 0
+        case "$choice" in
+            1) v="$(tui_input "添加端口" "格式: 端口/协议[/族]")" || continue
+               out="$(config_add_port "$v" 2>&1)" || true; tui_msg "结果" "$out" ;;
+            2) v="$(tui_input "删除端口" "输入要移除的条目:")" || continue
+               out="$(config_del_port "$v" 2>&1)" || true; tui_msg "结果" "$out" ;;
+            3) v="$(tui_input "添加 IP" "IP 或 CIDR:")" || continue
+               out="$(config_add_ip "$v" 2>&1)" || true; tui_msg "结果" "$out" ;;
+            4) v="$(tui_input "删除 IP" "输入要移除的 IP:")" || continue
+               out="$(config_del_ip "$v" 2>&1)" || true; tui_msg "结果" "$out" ;;
+            5) out="$(config_list ports 2>&1; echo; config_list ip 2>&1)"; tui_msg "当前白名单" "$out" ;;
+            6) tui_edit_file ports ;;
+            7) tui_edit_file ip ;;
+            q|"") return 0 ;;
+        esac
+    done
+}
+
+tui_ban() {
+    local choice ip out
+    choice="$(tui_dlg --title "封禁管理" --menu "手动封禁/解封" 10 60 3 \
+        1 "封禁 IP" 2 "解封 IP" 3 "查看当前封禁")" || return 0
+    case "$choice" in
+        1) ip="$(tui_input "封禁 IP" "输入要封禁的 IP:")" || return 0
+           out="$(ban_ip "$ip" 2>&1)" || true; tui_msg "结果" "$out" ;;
+        2) ip="$(tui_input "解封 IP" "输入要解封的 IP:")" || return 0
+           out="$(unban_ip "$ip" 2>&1)" || true; tui_msg "结果" "$out" ;;
+        3) out="$(fail2ban_read status 2>/dev/null || echo 'fail2ban 未运行')\n手动封禁:\n$(ufw_read status | grep auto-firewall-manual || echo '  (无)')"
+           tui_msg "封禁状态" "$out" ;;
+    esac
+}
+
+tui_run() {
+    local out err=0
+    case "$1" in
+        1) out="$(show_status 2>&1)"; tui_msg "总览仪表盘" "$out" ;;
+        2) out="$(port_check 2>&1)" || err=1; tui_msg "端口检测$([[ $err == 1 ]] && echo 部分失败)" "$out" ;;
+        3) out="$(fail2ban_check 2>&1)" || err=1; tui_msg "Fail2ban 检测" "$out" ;;
+        4) out="$(cleanup 2>&1)"; tui_msg "系统清理" "$out" ;;
+        5) tui_config ;;
+        6) if dialog --title "恢复默认" --yesno "确认恢复默认配置(all)? 将先备份" 10 60 2>/dev/null; then
+               out="$(ASSUME_YES=1 reset_config all 2>&1)" || true; tui_msg "恢复默认" "$out"
+           fi ;;
+        7) tui_ban ;;
+        8) dialog --title "实时日志" --tailbox "$LOG_FILE" 24 80 2>/dev/null ;;
+        9) out="$(DRY_RUN=1 port_check 2>&1)" || true
+           out="$(grep '\[DRYRUN\]' "$LOG_FILE" | tail -30)"
+           tui_msg "Dry-run 将要执行的动作(最近30条)" "$out" ;;
+        10) out="$(show_version 2>&1)"; tui_msg "版本信息" "$out" ;;
+        0) uninstall ;;
+        q|"") return 0 ;;
+    esac
+}
+
+tui_menu() {
+    if ! command -v dialog &>/dev/null || [[ ! -t 1 ]]; then
+        _info "无 dialog 或非交互终端, 降级为文本帮助"
+        show_help
+        return 0
+    fi
+    ensure_locale_utf8
+    local choice
+    while true; do
+        choice="$(tui_dlg --title "管理菜单" --menu "请选择操作" 20 66 12 \
+            1 "总览仪表盘" 2 "端口检测" 3 "Fail2ban检测" 4 "系统清理" \
+            5 "配置管理(增删/编辑)" 6 "恢复默认配置" 7 "封禁/解封 IP" 8 "实时日志" \
+            9 "Dry-run 演练" 10 "版本信息" 0 "卸载脚本与配置" q "退出")" || break
+        tui_run "$choice" || _err "菜单动作返回错误"
+    done
+    clear 2>/dev/null || true
+}
+
 #---- Fail2ban + Nginx + UFW 集成 ---------------------------------------------
 # 检测 Nginx 日志路径（spec §5: 输出 access 与 error 两行, 供不同 jail 归位）
 detect_nginx_logpath() {
@@ -1340,6 +1468,32 @@ cleanup() {
 }
 
 #---- Cron 部署 ---------------------------------------------------------------
+# profile.d 快捷命令目标（测试 seam, spec §6.2）
+SHORTCUT_TARGET="${AUTO_FW_SHORTCUT_TARGET:-/etc/profile.d/auto-firewall.sh}"
+
+# 写入 x/X 命令行快捷命令（替代 sudo bash auto-firewall.sh）, 幂等区块
+install_shortcut() {
+    mkdir -p "$(dirname "$SHORTCUT_TARGET")"
+    if [[ -f "$SHORTCUT_TARGET" ]]; then
+        sed -i '/# BEGIN auto-firewall-shortcut/,/# END auto-firewall-shortcut/d' "$SHORTCUT_TARGET"
+    fi
+    cat >> "$SHORTCUT_TARGET" <<'SC'
+# BEGIN auto-firewall-shortcut
+afw_shortcut() {
+    if [[ $# -eq 0 ]]; then
+        sudo bash /opt/auto-firewall/auto-firewall.sh menu
+    else
+        sudo bash /opt/auto-firewall/auto-firewall.sh "$@"
+    fi
+}
+x() { afw_shortcut "$@"; }
+X() { afw_shortcut "$@"; }
+# END auto-firewall-shortcut
+SC
+    chmod 644 "$SHORTCUT_TARGET"
+    _info "快捷命令 x/X 已写入 $SHORTCUT_TARGET"
+}
+
 install_cron() {
     _info "正在配置 Crontab 定时任务..."
 
@@ -1507,6 +1661,16 @@ do_install() {
     # 安装 Cron
     install_cron
 
+    # TUI 依赖 dialog（失败不致命, 降级为文本帮助）
+    if ! command -v dialog &>/dev/null; then
+        _info "安装 dialog（TUI 依赖）..."
+        apt_exec update -qq && apt_exec install -y -qq dialog \
+            || _err "dialog 安装失败, menu 将降级为文本帮助"
+    fi
+
+    # 命令行快捷命令 x/X（spec §6.2）
+    install_shortcut
+
     _info "安装完成！"
     echo ""
     echo "=============================================="
@@ -1521,11 +1685,14 @@ do_install() {
     echo "    端口白名单: ${WHITELIST_FILE}"
     echo "    IP 白名单:  ${IP_WHITELIST_FILE}"
     echo ""
+    echo "  快捷命令: x（需重新登录或 source ${SHORTCUT_TARGET} 生效）"
+    echo ""
     echo "  手动运行:"
     echo "    sudo bash auto-firewall.sh port-check"
     echo "    sudo bash auto-firewall.sh fail2ban-check"
     echo "    sudo bash auto-firewall.sh cleanup"
     echo "    sudo bash auto-firewall.sh status"
+    echo "    sudo bash auto-firewall.sh menu"
     echo "=============================================="
 }
 
@@ -1572,6 +1739,14 @@ main() {
         fail2ban-check) fail2ban_check ;;
         cleanup)        cleanup ;;
         status)         show_status ;;
+        menu)
+            if command -v dialog &>/dev/null && [[ -t 1 ]]; then
+                ensure_locale_utf8
+                tui_menu
+            else
+                _info "dialog 不可用或非交互终端, 降级为文本帮助"
+                show_help
+            fi ;;
         config)         config_main "${CMD_ARGS[@]:1}" ;;
         reset-config)   reset_config "${CMD_ARGS[1]:-all}" ;;
         ban)            ban_ip "${CMD_ARGS[1]:-}" "${CMD_ARGS[2]:-}" ;;
