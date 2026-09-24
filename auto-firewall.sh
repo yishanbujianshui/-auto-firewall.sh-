@@ -766,244 +766,202 @@ fix_docker_ufw() {
     _info "Docker/UFW 兼容性修复完成。"
 }
 
-#---- 白名单管理 --------------------------------------------------------------
+#---- 白名单管理 v2（spec §2.4/§3）---------------------------------------------
+# 基于当前监听生成默认白名单（均为动态 tcp/udp 单端口）
 generate_whitelist() {
     _info "正在生成初始端口白名单..."
-    local scanner
-    scanner=$(detect_port_scanner)
-
-    local header
-    header="# ============================================
-# 防火墙自动脚本 - 端口白名单配置
-# 
-# 格式: 端口号/协议  # 服务名称
-# 示例: 8080/tcp  # 自定义Web服务
-# 
-# 白名单中的端口将始终在防火墙中保持放行状态。
-# 不会被脚本自动回收，如需回收请从此文件删除后重启脚本。
-# 支持 TCP 和 UDP 两种协议。
-# 
-# 生成时间: $(date '+%Y-%m-%d %H:%M:%S')
-# ============================================"
-
-    echo "$header" > "$WHITELIST_FILE"
-    echo "" >> "$WHITELIST_FILE"
-    echo "# --- 自动检测到的端口（基于首次运行时的监听状态）---" >> "$WHITELIST_FILE"
-
-    # 扫描监听端口，使用临时文件避免在循环中多次调用
-    local raw_ports
-    if [[ "$scanner" == "ss" ]]; then
-        # ss 输出格式: LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:(("sshd",pid=123,fd=3))
-        raw_ports=$(ss -tlnp 2>/dev/null; ss -ulnp 2>/dev/null)
-    else
-        raw_ports=$(netstat -tlnp 2>/dev/null; netstat -ulnp 2>/dev/null)
-    fi
-
-    local seen=""
-    # 使用进程替换避免子shell导致变量不持久化
-    while IFS= read -r line; do
-        # 提取地址和端口（ss格式: 0.0.0.0:22 或 [::]:22）
-        local addr
-        addr=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if($i~/^[][0-9a-fA-F.:*]+:[0-9]+$/) {print $i; exit}}')
-        [[ -z "$addr" ]] && continue
-
-        local port
-        port=$(echo "$addr" | rev | cut -d: -f1 | rev)
-        # 端口必须为纯数字
-        [[ "$port" =~ ^[0-9]+$ ]] || continue
-
-        # 判断协议（tcp 或 udp）
-        local proto="tcp"
-        if echo "$line" | grep -qi 'udp'; then
-            proto="udp"
-        fi
-
-        local key="${port}/${proto}"
-        # 排除回环地址和已记录条目
-        local ip_part
-        ip_part=$(echo "$addr" | sed 's/:[0-9]*$//' | tr -d '[]')
-        if [[ "$ip_part" == "127.0.0.1" || "$ip_part" == "::1" ]]; then
-            continue
-        fi
-
-        # 去重
-        if echo "$seen" | grep -qw "$key"; then
-            continue
-        fi
-        seen="${seen} ${key}"
-
-        # 获取服务名
-        local service_name
-        service_name=$(echo "$line" | sed -n 's/.*users:(("\([^"]*\)".*/\1/p')
-        [[ -z "$service_name" ]] && service_name="unknown"
-
-        echo "${port}/${proto}  # ${service_name}" >> "$WHITELIST_FILE"
-    done < <(echo "$raw_ports")
-
+    local keys k base port proto svc raw
+    keys="$(scan_current_keys || true)"
+    raw="$(ss_listen_raw 2>/dev/null || true)"
+    {
+        echo "# schema-version: 2"
+        cat <<'GWHDR'
+# ============================================
+# 防火墙自动脚本 - 端口白名单配置（v2 语法）
+#
+# 格式: 端口/协议[/地址族]  # 服务名
+#   22/tcp              # SSH（双栈）
+#   8000:8100/tcp       # 端口区间
+#   443/tcp/v6          # 仅 IPv6
+#   icmp 或 -/esp       # 无端口协议
+#
+# 白名单端口始终放行且不受自动回收影响。
+GWHDR
+        echo "# 生成时间: $(date '+%Y-%m-%d %H:%M:%S')"
+        echo "# ============================================"
+        echo ""
+        echo "# --- 自动检测到的端口（基于首次运行时的监听状态）---"
+    } > "$WHITELIST_FILE"
+    for k in $keys; do
+        base="${k%%/*}"; port="${base%%:*}"
+        proto="${k#*/}"; proto="${proto%%/*}"
+        svc="$(awk -v p=":${port} " 'index($0,p){ if (match($0,/\(\("[^"]+"/)){s=substr($0,RSTART+3);sub(/".*/,"",s);print s;exit} }' <<<"$raw")"
+        [[ -z "$svc" ]] && svc="auto-detected"
+        echo "${k}  # ${svc}" >> "$WHITELIST_FILE"
+    done
     echo "" >> "$WHITELIST_FILE"
     echo "# --- 用户自定义端口（可在此添加）---" >> "$WHITELIST_FILE"
     echo "# 8080/tcp  # 示例: 自定义Web服务" >> "$WHITELIST_FILE"
-
     _info "白名单已生成: $WHITELIST_FILE"
 }
 
-# 读取白名单端口列表
+# 读取白名单 -> canon key 逐行; 跳过注释/版本头/无法解析行（spec §2.4）
 read_whitelist() {
-    if [[ ! -f "$WHITELIST_FILE" ]]; then
-        return 1
-    fi
-    grep -E '^[0-9]+/(tcp|udp)' "$WHITELIST_FILE" 2>/dev/null \
-        | awk '{print $1}' \
-        | sort -u
+    [[ -f "$WHITELIST_FILE" ]] || return 1
+    local raw k
+    while IFS= read -r raw || [[ -n "$raw" ]]; do
+        k="$(canon_key "$raw" 2>/dev/null)" || continue
+        echo "$k"
+    done < "$WHITELIST_FILE" | sort -u
 }
 
-# 放行所有白名单端口
+#---- ufw 规则表缓存（spec §3.2, GAP-C）----------------------------------------
+# 注: 用 -gA 强制全局(脚本可能被 bats 在函数内 source, 普通 declare 会变成局部);
+#     声明与空赋值分开, `declare -A X=()` 会丢失关联属性(bash 怪癖)
+declare -gA UFW_EXIST
+declare -gA UFW_MARKER
+UFW_EXIST=()
+UFW_MARKER=()
+
+# 解析 ufw status 输出填充 EXIST/MARKER; 只读操作不走 run_cmd(dry-run 仍需真实状态)
+refresh_ufw_table() {
+    UFW_EXIST=(); UFW_MARKER=()
+    local line tok key marker famtok
+    while IFS= read -r line; do
+        [[ "$line" != *ALLOW* ]] && continue
+        line="${line#"${line%%[^ ]*}"}"                       # 去前导空白
+        line="$(sed 's/^\[[0-9]*\][[:space:]]*//' <<<"$line")" # 去 numbered 前缀
+        marker="none"
+        case "$line" in
+            *auto-firewall-whitelist*) marker="auto-firewall-whitelist" ;;
+            *auto-firewall-manual*)    marker="auto-firewall-manual" ;;
+            *auto-firewall*)           marker="auto-firewall" ;;
+        esac
+        tok="${line%% *}"
+        famtok=""
+        case "$line" in *"(v6)"*) famtok="/v6" ;; esac
+        key=""
+        if [[ "$tok" =~ ^[0-9]+(:[0-9]+)?/(tcp|udp)$ ]]; then
+            key="${tok}${famtok}"
+        elif [[ "$tok" =~ ^(icmp|esp|ah|gre|sctp|any)$ ]]; then
+            key="-/${tok}"
+        fi
+        [[ -z "$key" ]] && continue
+        UFW_EXIST["$key"]=1
+        [[ "$marker" != "none" ]] && UFW_MARKER["$key"]="$marker"
+    done < <(ufw status 2>/dev/null || true) || true   # 末行 continue 会使 while 返回非0, set -e 下需显式吞掉
+}
+
+# 采集当前监听 canon key 集合; v4-only 归一为双栈简写 key(避免 v1->v2 规则抖动)
+scan_current_keys() {
+    local raw line parsed p proto fam
+    local -A v4=() v6=()
+    raw="$(ss_listen_raw)" || return 1
+    while IFS= read -r line; do
+        [[ -z "$line" ]] && continue
+        parsed="$(parse_scan_line "$line")" || continue
+        IFS='|' read -r p proto fam <<<"$parsed"
+        case "$fam" in
+            4)   v4["${p}/${proto}"]=1 ;;
+            6)   v6["${p}/${proto}"]=1 ;;
+            all) v4["${p}/${proto}"]=1; v6["${p}/${proto}"]=1 ;;
+        esac
+    done <<<"$raw"
+    local k
+    for k in "${!v4[@]}"; do echo "$k"; done
+    for k in "${!v6[@]}"; do
+        [[ -n "${v4[$k]:-}" ]] || echo "${k}/v6"
+    done | sort -u
+}
+
+# 放行所有白名单端口（幂等: 查缓存表; 数组传参防注入）
 apply_whitelist() {
     local whitelist
-    whitelist=$(read_whitelist || true)
+    whitelist="$(read_whitelist 2>/dev/null || true)"
     if [[ -z "$whitelist" ]]; then
         _info "白名单为空，跳过端口放行。"
         return 0
     fi
-
+    refresh_ufw_table
+    local entry err=0
+    local -a args
     while IFS= read -r entry; do
         [[ -z "$entry" ]] && continue
-        local port proto
-        port=$(echo "$entry" | cut -d/ -f1)
-        proto=$(echo "$entry" | cut -d/ -f2)
-
-        # 检查是否已有相同规则
-        if ufw status | grep -q "^${port}/${proto}"; then
-            continue
+        [[ -n "${UFW_EXIST[$entry]:-}" ]] && continue
+        mapfile -t args < <(build_ufw_args "$entry" allow)
+        if (( ${#args[@]} == 0 )); then
+            _err "非法白名单条目: ${entry}"; err=1; continue
         fi
-
-        ufw allow "${port}/${proto}" comment 'auto-firewall-whitelist' &>/dev/null || true
-        _info "白名单放行: ${port}/${proto}"
-    done <<< "$whitelist"
+        if ufw_exec "${args[@]}" comment "auto-firewall-whitelist" >/dev/null 2>&1; then
+            _info "白名单放行: ${entry}"
+        else
+            _err "白名单放行失败: ${entry}"; err=1
+        fi
+    done <<<"$whitelist"
+    return $err
 }
 
-#---- 端口检测与动态管理 ------------------------------------------------------
+#---- 端口检测与动态管理（v2）--------------------------------------------------
 port_check() {
     acquire_lock
     _info "开始端口扫描..."
 
-    # 0. Docker 环境自适应检测（后续安装 Docker 时自动修复 UFW 兼容性）
+    # 0. Docker 环境自适应检测
     fix_docker_ufw
 
-    local scanner
-    scanner=$(detect_port_scanner)
-
     # 1. 确保白名单端口都已放行
-    apply_whitelist
+    apply_whitelist || _err "白名单放行存在错误"
 
-    # 2. 扫描当前监听端口
-    local current_ports=""
-    local scan_output
-    if [[ "$scanner" == "ss" ]]; then
-        scan_output=$(ss -tlnp 2>/dev/null; ss -ulnp 2>/dev/null)
-    else
-        scan_output=$(netstat -tlnp 2>/dev/null; netstat -ulnp 2>/dev/null)
-    fi
+    # 2. 采集当前监听 / 白名单 / 上次状态
+    local cur wl prev
+    cur="$(scan_current_keys || true)"
+    wl="$(read_whitelist 2>/dev/null || true)"
+    prev=""
+    [[ -f "$STATE_FILE" ]] && prev="$(grep -v '^#' "$STATE_FILE" 2>/dev/null | tr '\n' ' ')"
 
-    # 使用进程替换避免子shell导致变量不持久化
+    # 3. 规则表缓存 + 差分执行（尽力而为, 结束汇总退出, spec §2.5）
+    refresh_ufw_table
+    local actions line op key err=0
+    actions="$(compute_port_actions "$(echo "$cur" | tr '\n' ' ')" "$prev" "$(echo "$wl" | tr '\n' ' ')")"
+    local -a args
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
-        local addr
-        addr=$(echo "$line" | awk '{for(i=1;i<=NF;i++) if($i~/^[][0-9a-fA-F.:*]+:[0-9]+$/) {print $i; exit}}')
-        [[ -z "$addr" ]] && continue
-
-        local port
-        port=$(echo "$addr" | rev | cut -d: -f1 | rev)
-        [[ "$port" =~ ^[0-9]+$ ]] || continue
-
-        local ip_part
-        ip_part=$(echo "$addr" | sed 's/:[0-9]*$//' | tr -d '[]')
-        [[ "$ip_part" == "127.0.0.1" || "$ip_part" == "::1" ]] && continue
-
-        local proto="tcp"
-        echo "$line" | grep -qi 'udp' && proto="udp"
-
-        local key="${port}/${proto}"
-        if ! echo "$current_ports" | grep -qw "$key"; then
-            current_ports="${current_ports} ${key}"
+        op="${line%%:*}"; key="${line#*:}"
+        mapfile -t args < <(build_ufw_args "$key" "$([[ "$op" == "ADD" ]] && echo allow || echo delete)")
+        if (( ${#args[@]} == 0 )); then
+            _err "非法 key: ${key}"; err=1; continue
         fi
-    done < <(echo "$scan_output")
+        if [[ "$op" == "ADD" ]]; then
+            [[ -n "${UFW_EXIST[$key]:-}" ]] && continue
+            if ufw_exec "${args[@]}" comment "auto-firewall" >/dev/null 2>&1; then
+                _info "自动放行: ${key}"
+            else
+                _err "放行失败: ${key}"; err=1
+            fi
+        else
+            # 仅回收脚本自动添加的动态规则
+            if [[ "${UFW_MARKER[$key]:-}" == "auto-firewall" ]]; then
+                if ufw_exec "${args[@]}" >/dev/null 2>&1; then
+                    _info "自动回收: ${key}"
+                else
+                    _err "回收失败: ${key}"; err=1
+                fi
+            fi
+        fi
+    done <<<"$actions"
 
-    # 3. 读取白名单（这些端口不受动态回收影响）
-    local whitelist
-    whitelist=$(read_whitelist 2>/dev/null || true)
+    # 4. 更新状态文件: 仅记录非白名单动态端口
+    local k dyn=""
+    for k in $cur; do
+        if [[ -n "$wl" ]] && echo "$wl" | grep -qxF "$k"; then continue; fi
+        dyn="${dyn}${k}"$'\n'
+    done
+    { echo "# schema-version: 2"; printf '%s' "$dyn" | sort -u | sed '/^$/d'; } > "$STATE_FILE"
 
-    # 4. 读取上次状态
-    local prev_ports=""
-    if [[ -f "$STATE_FILE" ]]; then
-        prev_ports=$(cat "$STATE_FILE")
+    if (( err )); then
+        _err "端口扫描部分失败。"
+        return 1
     fi
-
-    # 5. 放行新出现的非白名单端口
-    if [[ -n "$current_ports" ]]; then
-        for entry in $current_ports; do
-            local port proto
-            port=$(echo "$entry" | cut -d/ -f1)
-            proto=$(echo "$entry" | cut -d/ -f2)
-
-            # 白名单端口跳过（已经在上面的 apply_whitelist 处理了）
-            if echo "$whitelist" | grep -qw "$entry"; then
-                continue
-            fi
-
-            # 检查 ufw 是否已有此规则
-            if ufw status | grep -q "^${port}/${proto}"; then
-                continue
-            fi
-
-            ufw allow "${port}/${proto}" comment 'auto-firewall' &>/dev/null || true
-            _info "自动放行: ${port}/${proto}"
-        done
-    fi
-
-    # 6. 回收已不再监听的端口（仅回收脚本自动添加的，不影响白名单和手动规则）
-    if [[ -n "$prev_ports" ]]; then
-        for entry in $prev_ports; do
-            local port proto
-            port=$(echo "$entry" | cut -d/ -f1)
-            proto=$(echo "$entry" | cut -d/ -f2)
-
-            # 白名单端口不回收
-            if echo "$whitelist" | grep -qw "$entry"; then
-                continue
-            fi
-
-            # 当前仍在监听则不回收
-            if echo "$current_ports" | grep -qw "$entry"; then
-                continue
-            fi
-
-            # SSH 端口保护：如果端口号在白名单中且服务含 ssh，绝不回收
-            if echo "$whitelist" | grep -q "^${port}/${proto}.*ssh" 2>/dev/null; then
-                _info "SSH 端口 ${port}/${proto} 已保护，不回收。"
-                continue
-            fi
-
-            # 仅删除带有 auto-firewall 标记的规则
-            if ufw status | grep -q "^${port}/${proto}.*auto-firewall"; then
-                ufw --force delete allow "${port}/${proto}" &>/dev/null || true
-                _info "自动回收: ${port}/${proto}"
-            fi
-        done
-    fi
-
-    # 7. 更新状态文件（只记录非白名单的动态端口）
-    local new_state=""
-    if [[ -n "$current_ports" ]]; then
-        for entry in $current_ports; do
-            if ! echo "$whitelist" | grep -qw "$entry"; then
-                new_state="${new_state}${entry}
-"
-            fi
-        done
-    fi
-    echo "$new_state" | sort -u > "$STATE_FILE"
-
     _info "端口扫描完成。"
 }
 
