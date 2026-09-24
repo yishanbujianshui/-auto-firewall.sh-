@@ -300,6 +300,103 @@ acquire_lock() {
     fi
 }
 
+#---- 无损升级 v2（spec §4）------------------------------------------------
+BACKUP_DIR="${SCRIPT_DIR}/backup"
+readonly BACKUP_RETAIN=10                      # 仅保留最近 N 份快照（G5/GAP-6）
+
+# 全量快照配置到 backup/<ts>/, 修剪至最近 BACKUP_RETAIN 份; 输出快照目录
+backup_configs() {
+    local ts dst
+    ts="$(date +%Y%m%d%H%M%S)"
+    dst="${BACKUP_DIR}/${ts}"
+    mkdir -p "$dst" || return 1
+    chmod 700 "$BACKUP_DIR" "$dst" 2>/dev/null || true
+    local f
+    for f in "$WHITELIST_FILE" "$STATE_FILE" "$IP_WHITELIST_FILE" "$VERSION_FILE"; do
+        [[ -f "$f" ]] && cp -a "$f" "$dst/" 2>/dev/null || true
+    done
+    # 保留策略: 目录名按时间戳降序, 删除超出部分
+    local -a dirs=()
+    mapfile -t dirs < <(find "$BACKUP_DIR" -maxdepth 1 -mindepth 1 -type d -printf '%f\n' 2>/dev/null | sort -r)
+    local i
+    for (( i=BACKUP_RETAIN; i<${#dirs[@]}; i++ )); do
+        rm -rf "${BACKUP_DIR:?}/${dirs[$i]}"
+    done
+    echo "$dst"
+}
+
+# v1 -> v2: 白名单/state 换发为 v2 语法; 注释与无法解析的行原样保留（GAP-1）
+migrate_v1_to_v2() {
+    backup_configs >/dev/null || { _err "备份失败, 中止迁移"; return 1; }
+    local raw c comment
+    if [[ -f "$WHITELIST_FILE" ]]; then
+        local tmp="${WHITELIST_FILE}.mig.$$"
+        {
+            echo "# schema-version: 2"
+            while IFS= read -r raw || [[ -n "$raw" ]]; do
+                local trimmed="${raw#"${raw%%[![:space:]]*}"}"
+                if [[ -z "$trimmed" || "$trimmed" == \#* ]]; then
+                    printf '%s\n' "$raw"
+                elif c="$(canon_key "$raw" 2>/dev/null)"; then
+                    comment=""
+                    [[ "$raw" == *\#* ]] && comment="${raw#*#}"
+                    printf '%s  #%s\n' "$c" "$comment"
+                else
+                    printf '%s\n' "$raw"      # 非注释但解析不了: 保留不丢
+                fi
+            done < "$WHITELIST_FILE"
+        } > "$tmp" && mv "$tmp" "$WHITELIST_FILE"
+    fi
+    if [[ -f "$STATE_FILE" ]]; then
+        local tmps="${STATE_FILE}.mig.$$" s
+        {
+            echo "# schema-version: 2"
+            while IFS= read -r s || [[ -n "$s" ]]; do
+                [[ -z "$s" ]] && continue
+                canon_key "$s" 2>/dev/null || printf '%s\n' "$s"
+            done < "$STATE_FILE"
+        } > "$tmps" && mv "$tmps" "$STATE_FILE"
+    fi
+    echo "$STATE_SCHEMA_VERSION" > "$VERSION_FILE"
+    _info "配置已从 v1 迁移至 v2"
+}
+
+# 迁移注册表: 逐级升级至 STATE_SCHEMA_VERSION; 失败时从最新备份还原
+run_migrations() {
+    local from=0
+    if [[ -f "$VERSION_FILE" ]]; then
+        from="$(tr -cd '0-9' < "$VERSION_FILE")"
+        from="${from:-0}"
+    elif [[ -f "$WHITELIST_FILE" || -f "$STATE_FILE" || -f "$IP_WHITELIST_FILE" ]]; then
+        from=1                                  # 存量安装无版本标记 -> 隐式 v1
+    else
+        echo "$STATE_SCHEMA_VERSION" > "$VERSION_FILE"
+        _info "全新环境, 直接写入 schema v${STATE_SCHEMA_VERSION}"
+        return 0
+    fi
+    while (( from < STATE_SCHEMA_VERSION )); do
+        case "$from" in
+            1) migrate_v1_to_v2 || { _err "迁移 v1->v2 失败, 尝试从备份还原"; restore_latest_backup; return 1; } ;;
+            *) _err "未知 schema 版本 ${from}, 无迁移路径"; return 1 ;;
+        esac
+        from="$(tr -cd '0-9' < "$VERSION_FILE" 2>/dev/null)"
+        [[ -n "$from" ]] || { _err "迁移未写入版本号"; restore_latest_backup; return 1; }
+    done
+    return 0
+}
+
+# 从最新备份还原配置（仅恢复迁移涉及的三个文件）
+restore_latest_backup() {
+    local latest
+    latest="$(find "$BACKUP_DIR" -maxdepth 1 -mindepth 1 -type d -printf '%f\n' 2>/dev/null | sort -r | head -1)"
+    [[ -z "$latest" ]] && { _err "无可用备份, 请手工检查 ${BACKUP_DIR}"; return 1; }
+    local src="${BACKUP_DIR}/${latest}" f
+    for f in port-whitelist.conf ports.state ip-whitelist.conf .schema_version; do
+        [[ -f "${src}/${f}" ]] && cp -a "${src}/${f}" "${SCRIPT_DIR}/${f}"
+    done
+    _info "已从备份 ${latest} 还原配置"
+}
+
 #---- IP 白名单管理 ------------------------------------------------------------
 # 读取 IP 白名单（去注释、去空行），返回空格分隔的 IP/CIDR 列表
 read_ip_whitelist() {
@@ -1103,6 +1200,9 @@ do_install() {
     # 创建目录结构
     mkdir -p "$SCRIPT_DIR" "$LOG_DIR"
     chmod 755 "$SCRIPT_DIR" "$LOG_DIR"
+
+    # 无损升级: 先完成配置迁移再初始化（spec §4）
+    run_migrations || { _err "配置迁移失败, 安装中止（原配置未受影响）"; exit 1; }
 
     # 复制自身到目标位置（如果不在目标位置）
     if [[ "$SCRIPT_PATH" != "${SCRIPT_DIR}/auto-firewall.sh" ]]; then
