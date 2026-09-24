@@ -671,6 +671,85 @@ show_log() {
     tail -n "$n" "$LOG_FILE"
 }
 
+#---- 卸载 uninstall（spec §8）------------------------------------------------
+# 安装/还原的系统路径根（测试 seam; 默认真实系统）
+UFW_ETC_DIR="${AUTO_FW_UFW_ETC_DIR:-/etc/ufw}"
+UNINSTALL_TARGET_ROOT="${AUTO_FW_UNINSTALL_ROOT:-}"
+
+# 还原 Docker/UFW 修复（仅 --purge）
+restore_docker_after_rules() {
+    local f="${UFW_ETC_DIR}/after.rules" bak
+    [[ -f "$f" ]] || return 0
+    if grep -qF "# BEGIN auto-firewall DOCKER-USER fix" "$f" 2>/dev/null; then
+        run_cmd cp "$f" "${f}.bak.$(date +%Y%m%d%H%M%S)" 2>/dev/null || true
+        bak="$(find "$UFW_ETC_DIR" -maxdepth 1 -name 'after.rules.bak.*' ! -newer "$f" 2>/dev/null | sort -r | head -1)"
+        if [[ -n "$bak" && -f "$bak" ]]; then
+            run_cmd cp "$bak" "$f" && _info "已从备份还原 after.rules"
+        else
+            run_cmd sed -i '/# BEGIN auto-firewall DOCKER-USER fix/,/# END auto-firewall DOCKER-USER fix/d' "$f" \
+                && _info "已剥离 DOCKER-USER 修复区块"
+        fi
+        ufw_exec reload >/dev/null 2>&1 || true
+    fi
+    return 0
+}
+
+# --purge 附加动作: 删脚本标记的 ufw 规则(SSH 保护)/还原 docker 修复/清理 fail2ban
+purge_firewall() {
+    refresh_ufw_table
+    local k err=0
+    local -a args
+    for k in "${!UFW_EXIST[@]}"; do
+        case "${UFW_MARKER[$k]:-none}" in
+            auto-firewall|auto-firewall-whitelist|auto-firewall-manual) : ;;
+            *) continue ;;
+        esac
+        if [[ "${k%%/*}" == "22" && "$FORCE_SSH" != "1" ]]; then
+            _info "保留 SSH 规则: $k（确需删除请加 --force-ssh）"
+            continue
+        fi
+        mapfile -t args < <(build_ufw_args "$k" delete)
+        if (( ${#args[@]} == 0 )); then
+            _err "无法解析规则 key: $k"; err=1; continue
+        fi
+        ufw_exec "${args[@]}" >/dev/null 2>&1 || { _err "删除规则失败: $k"; err=1; }
+    done
+    restore_docker_after_rules
+    run_cmd rm -f "$FAIL2BAN_JAIL_CONF" "${FAIL2BAN_ACTION_DIR}/ufw.conf" \
+        "${FAIL2BAN_FILTER_DIR}/nginx-ufw.conf" "${FAIL2BAN_FILTER_DIR}/nginx-404.conf"
+    svc_exec disable --now fail2ban
+    return $err
+}
+
+# 两档卸载: 默认仅删脚本足迹(系统防火墙/fail2ban 保持现状); --purge 含防火墙足迹
+uninstall() {
+    acquire_lock
+    local R="$UNINSTALL_TARGET_ROOT"
+    confirm "卸载 auto-firewall? 默认仅移除脚本足迹, 不改动系统防火墙与 fail2ban" || { _info "已取消"; return 1; }
+    if [[ "$PURGE" == "1" ]]; then
+        confirm "【危险】--purge 将删除本脚本添加的防火墙规则、还原 Docker 修复并停用 fail2ban。SSH(22) 规则默认保留" || { _info "已取消"; return 1; }
+        if [[ "$ASSUME_YES" != "1" && ! -t 0 ]]; then
+            _err "非交互执行 --purge 必须显式传 --yes"
+            return 1
+        fi
+        local keep=""
+        keep="$(backup_configs)" || { _err "备份失败, 中止卸载"; return 1; }
+        purge_firewall || _err "部分防火墙残留清理失败, 继续卸载"
+        # 卸载前备份移出被删目录, 长期保留（dry-run 不执行）
+        if [[ "$DRY_RUN" != "1" && -z "$R" && -n "$keep" ]]; then
+            local dest="/root/auto-firewall-uninstall-backup-$(date +%Y%m%d%H%M%S)"
+            mkdir -p "$dest" && cp -a "$keep"/. "$dest/" \
+                && _info "卸载前备份已保存: $dest"
+        fi
+    fi
+    run_cmd rm -f "${R}/etc/profile.d/auto-firewall.sh"
+    if [[ -f "${R}/etc/crontab" ]]; then
+        run_cmd sed -i '/# BEGIN auto-firewall/,/# END auto-firewall/d' "${R}/etc/crontab"
+    fi
+    run_cmd rm -rf "${SCRIPT_DIR:?}"
+    _info "卸载完成。提示: 系统级 ufw/fail2ban 仍在生效（封禁未停止）, 如需一并停用请改用 uninstall --purge（GAP-D）"
+}
+
 #---- Fail2ban + Nginx + UFW 集成 ---------------------------------------------
 # 检测 Nginx 日志路径（spec §5: 输出 access 与 error 两行, 供不同 jail 归位）
 detect_nginx_logpath() {
@@ -1499,6 +1578,7 @@ main() {
         unban)          unban_ip "${CMD_ARGS[1]:-}" ;;
         version)        show_version ;;
         log)            show_log "${CMD_ARGS[1]:-100}" ;;
+        uninstall)      uninstall ;;
         help|--help|-h) show_help ;;
         *)
             echo "错误: 未知命令 '$cmd'" >&2

@@ -9,7 +9,8 @@ setup() {
     mkdir -p "$AUTO_FW_HOME/logs" "$FAKE_ROOT/etc/profile.d" "$AUTO_FW_HOME/f2b"
     STUB="$(mktemp -d)"
     export PATH="$STUB:$PATH"
-    export UFW_LOG="$AUTO_FW_HOME/ufw.calls"; : > "$UFW_LOG"
+    # UFW_LOG 必须在 AUTO_FW_HOME 之外(uninstall 会删整个 home)
+    UFW_LOG="$(mktemp)"; export UFW_LOG; : > "$UFW_LOG"
 
     # 系统路径 seam 全部指向临时区
     export AUTO_FW_F2B_JAIL_CONF="$AUTO_FW_HOME/f2b/jail.local"
@@ -44,12 +45,12 @@ UF
     LOCK_FILE="$AUTO_FW_HOME/.script.lock"
 }
 
-teardown() { rm -rf "$AUTO_FW_HOME" "$STUB" "$FAKE_ROOT"; }
+teardown() { rm -rf "$AUTO_FW_HOME" "$STUB" "$FAKE_ROOT" "$UFW_LOG"; }
 
 @test "默认档: 移除 profile.d 快捷脚本与 crontab 区块与 SCRIPT_DIR" {
     ASSUME_YES=1 uninstall
     [ ! -f "$FAKE_ROOT/etc/profile.d/auto-firewall.sh" ]
-    ! grep -q 'auto-firewall' "$FAKE_ROOT/etc/crontab"
+    if grep -q 'auto-firewall' "$FAKE_ROOT/etc/crontab"; then echo "crontab 区块未清理"; return 1; fi
     grep -q '^LANG=' "$FAKE_ROOT/etc/crontab"     # 保留其它 cron 内容
     [ ! -d "$SCRIPT_DIR" ]
 }
