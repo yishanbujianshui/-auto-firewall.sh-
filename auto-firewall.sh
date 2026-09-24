@@ -24,9 +24,12 @@ VERSION_FILE="${SCRIPT_DIR}/.schema_version"
 readonly MAX_LOG_SIZE=$((1024 * 1024))       # 日志超过1MB自动截断
 readonly LOG_RETAIN_LINES=500                 # 截断后保留最后500行
 readonly MEM_FREE_THRESHOLD=20                # 空闲内存低于此百分比才释放缓存
-readonly FAIL2BAN_JAIL_CONF="/etc/fail2ban/jail.local"
-readonly FAIL2BAN_FILTER_DIR="/etc/fail2ban/filter.d"
-readonly FAIL2BAN_ACTION_DIR="/etc/fail2ban/action.d"
+# 系统路径支持 env seam（bats 隔离注入, spec §2.6）
+FAIL2BAN_JAIL_CONF="${AUTO_FW_F2B_JAIL_CONF:-/etc/fail2ban/jail.local}"
+FAIL2BAN_FILTER_DIR="${AUTO_FW_F2B_FILTER_DIR:-/etc/fail2ban/filter.d}"
+FAIL2BAN_ACTION_DIR="${AUTO_FW_F2B_ACTION_DIR:-/etc/fail2ban/action.d}"
+UFW_DEFAULT_FILE="${AUTO_FW_UFW_DEFAULT:-/etc/default/ufw}"
+NGINX_LOG_DIR="${AUTO_FW_NGINX_LOG_DIR:-/var/log/nginx}"
 readonly F2B_BANTIME=3600                     # 封禁时长（秒），默认1小时
 readonly F2B_FINDTIME=600                     # 统计窗口（秒），默认10分钟
 readonly F2B_MAXRETRY=5                       # 最大重试次数
@@ -447,29 +450,28 @@ WL_EOF
 }
 
 #---- Fail2ban + Nginx + UFW 集成 ---------------------------------------------
-# 检测 Nginx 日志路径
+# 检测 Nginx 日志路径（spec §5: 输出 access 与 error 两行, 供不同 jail 归位）
 detect_nginx_logpath() {
-    local candidate_paths=(
-        "/var/log/nginx/access.log"
-        "/var/log/nginx/access_log"
-    )
-    for p in "${candidate_paths[@]}"; do
-        if [[ -f "$p" ]]; then
-            echo "$p"
-            return 0
-        fi
+    local a="" e="" p
+    for p in "$NGINX_LOG_DIR/access.log" "$NGINX_LOG_DIR/access_log"; do
+        [[ -f "$p" ]] && { a="$p"; break; }
     done
-    # 尝试从 nginx 配置中提取
-    if command -v nginx &>/dev/null; then
-        local from_conf
-        from_conf=$(nginx -T 2>/dev/null | grep -oP 'access_log\s+\K[^;]+' | head -1 || true)
-        if [[ -n "$from_conf" && -f "$from_conf" ]]; then
-            echo "$from_conf"
-            return 0
-        fi
+    if [[ -z "$a" ]] && command -v nginx &>/dev/null; then
+        p="$(nginx -T 2>/dev/null | grep -oP 'access_log\s+\K[^;]+' | head -1 || true)"
+        [[ -n "$p" && -f "$p" ]] && a="$p"
     fi
-    return 1
+    [[ -f "$NGINX_LOG_DIR/error.log" ]] && e="$NGINX_LOG_DIR/error.log"
+    [[ -z "$a" && -z "$e" ]] && return 1
+    echo "$a"
+    echo "$e"
 }
+
+# 是否有邮件传输代理（决定 fail2ban action 降级, spec §5）
+has_mta() { command -v sendmail &>/dev/null || command -v postfix &>/dev/null || command -v mail &>/dev/null; }
+
+# 只读查询不走 run_cmd（dry-run 仍需真实状态）
+fail2ban_read() { fail2ban-client "$@" 2>/dev/null; }
+svc_active()  { systemctl is-active --quiet "$1" 2>/dev/null || service "$1" status &>/dev/null; }
 
 # 初始化/更新 Fail2ban + Nginx 集成
 init_fail2ban() {
@@ -527,37 +529,53 @@ N404FILTER
     rebuild_f2b_jail
 
     # 7. 确保 fail2ban 开机启动并运行
-    if command -v systemctl &>/dev/null; then
-        systemctl enable fail2ban &>/dev/null || true
-    fi
-    service fail2ban restart &>/dev/null || systemctl restart fail2ban &>/dev/null || true
+    svc_exec enable fail2ban
+    svc_exec restart fail2ban
     _info "Fail2ban 配置完成。"
 }
 
-# 重建 fail2ban jail.local（合并 IP 白名单）
+# 重建 fail2ban jail.local（合并 IP 白名单; 各 nginx jail 按日志存在性启用; 无 MTA 降级）
 rebuild_f2b_jail() {
     local ignore_ips
-    ignore_ips=$(read_ip_whitelist)
-    local nginx_log
-    nginx_log=$(detect_nginx_logpath 2>/dev/null || true)
+    ignore_ips="$(read_ip_whitelist)"
+    local -a loglines=()
+    mapfile -t loglines < <(detect_nginx_logpath 2>/dev/null || true)
+    local nginx_access="${loglines[0]:-}"
+    local nginx_error="${loglines[1]:-}"
+
+    local default_action="%(action_)s"
+    has_mta && default_action="%(action_mwl)s"
 
     local nginx_jails=""
-    if [[ -n "$nginx_log" ]]; then
-        nginx_jails="
+    if [[ -n "$nginx_access" ]]; then
+        nginx_jails="${nginx_jails}
 [nginx-ufw]
 enabled  = true
 filter   = nginx-ufw
-logpath  = ${nginx_log}
+logpath  = ${nginx_access}
 maxretry = ${F2B_MAXRETRY}
 findtime = ${F2B_FINDTIME}
 bantime  = ${F2B_BANTIME}
 action   = ufw[name=nginx-ufw, protocol=all]
 
+[nginx-404]
+enabled  = true
+port     = http,https
+filter   = nginx-404
+logpath  = ${nginx_access}
+maxretry = 20
+findtime = ${F2B_FINDTIME}
+bantime  = $((F2B_BANTIME / 2))
+action   = ufw[name=nginx-404x, protocol=all]
+"
+    fi
+    if [[ -n "$nginx_error" ]]; then
+        nginx_jails="${nginx_jails}
 [nginx-bad-request]
 enabled  = true
 port     = http,https
 filter   = nginx-bad-request
-logpath  = ${nginx_log}
+logpath  = ${nginx_error}
 maxretry = 3
 findtime = ${F2B_FINDTIME}
 bantime  = ${F2B_BANTIME}
@@ -567,25 +585,16 @@ action   = ufw[name=nginx-badreq, protocol=all]
 enabled  = true
 port     = http,https
 filter   = nginx-botsearch
-logpath  = ${nginx_log}
+logpath  = ${nginx_error}
 maxretry = 3
 findtime = ${F2B_FINDTIME}
 bantime  = $((F2B_BANTIME * 2))
 action   = ufw[name=nginx-bot, protocol=all]
-
-[nginx-404]
-enabled  = true
-port     = http,https
-filter   = nginx-404
-logpath  = ${nginx_log}
-maxretry = 20
-findtime = ${F2B_FINDTIME}
-bantime  = $((F2B_BANTIME / 2))
-action   = ufw[name=nginx-404x, protocol=all]
 "
     fi
 
-    cat > "$FAIL2BAN_JAIL_CONF" <<JAILEOF
+    local out="${FAIL2BAN_JAIL_OUT_OVERRIDE:-$FAIL2BAN_JAIL_CONF}"
+    cat > "$out" <<JAILEOF
 # Fail2ban 配置 - 由 auto-firewall.sh 自动管理
 # 修改 IP 白名单: 编辑 ${IP_WHITELIST_FILE} 后运行 fail2ban-check
 [DEFAULT]
@@ -599,7 +608,7 @@ destemail = root
 mta = sendmail
 protocol = tcp
 chain = INPUT
-action = %(action_mwl)s
+action = ${default_action}
 
 [sshd]
 enabled  = true
@@ -630,63 +639,63 @@ fail2ban_check() {
     fi
 
     # 确保服务运行
-    if ! service fail2ban status &>/dev/null && ! systemctl is-active --quiet fail2ban &>/dev/null; then
+    if ! svc_active fail2ban; then
         _info "fail2ban 未运行，正在启动..."
-        service fail2ban start &>/dev/null || systemctl start fail2ban &>/dev/null || true
+        svc_exec start fail2ban
     fi
 
     # 2. 检测 Docker 是否新安装（自适应）
     fix_docker_ufw
 
-    # 3. 检测 Nginx 日志路径是否变化
-    local current_log
-    current_log=$(detect_nginx_logpath 2>/dev/null || true)
-    local configured_log=""
-    if [[ -f "$FAIL2BAN_JAIL_CONF" ]]; then
-        configured_log=$(awk '/^\[nginx-ufw\]/{found=1; next} /^\[/{found=0} found && /logpath/{sub(/.*logpath[[:space:]]*=[[:space:]]*/,""); print; exit}' "$FAIL2BAN_JAIL_CONF" 2>/dev/null | xargs || true)
-    fi
-
-    # 4. 检测 IP 白名单是否变化
-    local current_ignore
-    current_ignore=$(read_ip_whitelist)
-    local configured_ignore=""
-    if [[ -f "$FAIL2BAN_JAIL_CONF" ]]; then
-        configured_ignore=$(grep -oP '^ignoreip\s*=\s*\K.+' "$FAIL2BAN_JAIL_CONF" 2>/dev/null | xargs || true)
-    fi
-
-    local need_rebuild=false
-    if [[ "$current_log" != "$configured_log" ]]; then
-        _info "Nginx 日志路径已变化: '${configured_log}' -> '${current_log}'"
-        need_rebuild=true
-    fi
-    if [[ "$current_ignore" != "$configured_ignore" ]]; then
-        _info "IP 白名单已变化，正在同步..."
-        need_rebuild=true
-    fi
-
-    if $need_rebuild; then
-        rebuild_f2b_jail
-        if service fail2ban reload &>/dev/null || systemctl reload fail2ban &>/dev/null; then
-            :
+    # 3+4. 幂等同步: 先在临时路径重生成 jail, 与现行配置比对, 有差异才替换+重载
+    #       （同时覆盖 “nginx 日志路径变化” 与 “IP 白名单变化” 两类变更检测）
+    local tmp_jail="${STATE_FILE}.jail.tmp.$$" need_reload=false
+    if FAIL2BAN_JAIL_OUT_OVERRIDE="$tmp_jail" rebuild_f2b_jail; then
+        if [[ ! -f "$FAIL2BAN_JAIL_CONF" ]] || ! cmp -s "$tmp_jail" "$FAIL2BAN_JAIL_CONF"; then
+            _info "jail.local 与白名单/日志路径不同步, 正在更新..."
+            mv "$tmp_jail" "$FAIL2BAN_JAIL_CONF"
+            need_reload=true
         else
-            service fail2ban restart &>/dev/null || systemctl restart fail2ban &>/dev/null || true
+            rm -f "$tmp_jail"
         fi
+    else
+        rm -f "$tmp_jail"
+        _err "jail 预生成失败, 跳过同步"
+        need_reload=false
+    fi
+
+    if [[ "$need_reload" == "true" ]]; then
+        svc_exec reload fail2ban
         _info "Fail2ban 配置已更新并重载。"
     fi
 
     # 5. 输出当前封禁统计（遍历各 jail 汇总）
     local total_banned
-    total_banned=$(fail2ban-client status 2>/dev/null \
+    total_banned=$(fail2ban_read status \
         | awk '/Jail list:/{sub(/.*Jail list:[ \t]*/,""); gsub(/,/,""); for(i=1;i<=NF;i++) print $i}' \
         | while read -r j; do
             [[ -z "$j" ]] && continue
-            fail2ban-client status "$j" 2>/dev/null | grep -oP 'Total banned:\s*\K\d+' || echo 0
+            fail2ban_read status "$j" | grep -oP 'Total banned:\s*\K\d+' || echo 0
         done | awk '{s+=$1} END {print s+0}' || true)
     _info "Fail2ban 运行正常，当前累计封禁 IP 数: ${total_banned:-0}"
     _info "Fail2ban 检测完成。"
 }
 
 #---- ufw 初始化 --------------------------------------------------------------
+# GAP-B(spec §5): 必须在 ufw enable 之前确保 /etc/default/ufw IPV6=yes,
+# 否则存量机器迁移到 v2 后首次启用不会下发 IPv6 规则
+ensure_ipv6_before_enable() {
+    if [[ -f "$UFW_DEFAULT_FILE" ]]; then
+        if grep -q '^IPV6=' "$UFW_DEFAULT_FILE"; then
+            sed -i 's/^IPV6=.*/IPV6=yes/' "$UFW_DEFAULT_FILE"
+        else
+            echo "IPV6=yes" >> "$UFW_DEFAULT_FILE"
+        fi
+    fi
+    ufw_exec reload &>/dev/null || true
+    ufw_exec enable &>/dev/null || true
+}
+
 init_ufw() {
     _info "正在初始化 UFW 防火墙..."
 
@@ -696,12 +705,15 @@ init_ufw() {
         apt_exec update -qq && apt_exec install -y -qq ufw
     fi
 
+    # GAP-B: 先开 IPv6 再启用防火墙
+    ensure_ipv6_before_enable
+
     # 重置到干净状态并启用
     _info "配置默认策略: 拒绝入站 / 放行出站..."
-    ufw --force disable &>/dev/null || true
-    ufw --force enable  &>/dev/null || true
-    ufw default deny incoming
-    ufw default allow outgoing
+    ufw_exec --force disable &>/dev/null || true
+    ufw_exec --force enable  &>/dev/null || true
+    ufw_exec default deny incoming
+    ufw_exec default allow outgoing
 
     # Docker 兼容性修复
     fix_docker_ufw
@@ -1108,13 +1120,16 @@ show_status() {
     echo "=========================================="
     echo ""
 
+    echo "  版本: ${SCRIPT_VERSION}  schema: ${STATE_SCHEMA_VERSION}"
+    echo ""
+
     echo "[UFW 状态]"
     ufw status verbose 2>/dev/null || echo "  UFW 未安装或未启用"
     echo ""
 
-    echo "[白名单端口] ($WHITELIST_FILE)"
+    echo "[白名单端口（v2 语法: 端口/协议[/族], 含区间与无端口协议）] ($WHITELIST_FILE)"
     if [[ -f "$WHITELIST_FILE" ]]; then
-        grep -E '^[0-9]+/(tcp|udp)' "$WHITELIST_FILE" 2>/dev/null || echo "  (空)"
+        read_whitelist 2>/dev/null || echo "  (空)"
     else
         echo "  (白名单文件不存在)"
     fi
