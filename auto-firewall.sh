@@ -69,6 +69,70 @@ fail2ban_exec() { run_cmd fail2ban-client "$@"; }
 # 服务管理封装（systemctl 优先, 回退 service）
 svc_exec()      { systemctl "$@" 2>&1 || service "$@" 2>&1 || true; }
 
+#---- 端口描述符模型 v2（spec §2）----------------------------------------------
+# 行语法: <port-spec>/<proto>[/<addr>], 如 22/tcp, 8000:8100/tcp, 443/tcp/v6,
+#          icmp, -/esp, -/50, any
+# 输出: <port_from>|<port_to>|<proto>|<family>  (portless 前两项空; family=all/4/6)
+parse_descriptor() {
+    local line="${1:-}"
+    line="${line%%#*}"
+    line="$(printf '%s' "$line" | sed 's/^[[:space:]]*//;s/[[:space:]]*$//')"
+    [[ -z "$line" ]] && return 1
+
+    local spec proto addr="all"
+    if [[ "$line" == */*/* ]]; then
+        spec="${line%%/*}"; local rest="${line#*/}"
+        proto="${rest%%/*}"; addr="${rest#*/}"
+        case "$addr" in
+            v4) addr="4" ;;
+            v6) addr="6" ;;
+            *)  return 1 ;;
+        esac
+    elif [[ "$line" == */* ]]; then
+        spec="${line%%/*}"; proto="${line#*/}"
+    else
+        spec=""; proto="$line"                 # 名称协议（icmp/esp/any 等）
+    fi
+
+    # 协议白名单/协议号
+    case "$proto" in
+        tcp|udp|icmp|esp|ah|gre|any) : ;;
+        ''|*[!0-9]*) return 1 ;;
+        *) { (( proto >= 1 && proto <= 255 )); } || return 1 ;;
+    esac
+
+    local pf="" pt=""
+    if [[ -z "$spec" || "$spec" == "-" ]]; then
+        # portless: tcp/udp 必须带端口
+        [[ "$proto" == "tcp" || "$proto" == "udp" ]] && return 1
+    else
+        local a b
+        if [[ "$spec" == *:* ]]; then a="${spec%%:*}"; b="${spec##*:}"; else a="$spec"; b="$spec"; fi
+        [[ "$a" =~ ^[0-9]+$ && "$b" =~ ^[0-9]+$ ]] || return 1
+        (( a >= 1 && a <= 65535 && b >= 1 && b <= 65535 )) || return 1
+        (( a <= b )) || return 1
+        # 端口只允许 tcp/udp
+        [[ "$proto" == "tcp" || "$proto" == "udp" ]] || return 1
+        pf="$a"; pt="$b"
+    fi
+    echo "${pf}|${pt}|${proto}|${addr}"
+}
+
+# 规范化 key（用于 state/去重/成员判断）; portless 补 '-', family=all 省略 addr
+canon_key() {
+    local parsed
+    parsed="$(parse_descriptor "${1:-}")" || return 1
+    local pf pt proto fam
+    IFS='|' read -r pf pt proto fam <<<"$parsed"
+    local spec
+    if [[ -z "$pf" ]]; then spec="-"
+    elif [[ "$pf" == "$pt" ]]; then spec="$pf"
+    else spec="${pf}:${pt}"; fi
+    local key="${spec}/${proto}"
+    [[ "$fam" == "all" ]] || key="${key}/v${fam}"
+    echo "$key"
+}
+
 check_root() {
     if [[ $EUID -ne 0 ]]; then
         echo "错误: 此脚本必须以 root 身份执行，请使用 sudo。" >&2
