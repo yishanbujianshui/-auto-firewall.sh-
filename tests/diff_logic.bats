@@ -1,5 +1,6 @@
 #!/usr/bin/env bats
 # T6: compute_port_actions 放行/回收差分（spec §3.3）
+bats_require_minimum_version 1.5.0
 
 load test_helper/common
 
@@ -35,10 +36,12 @@ load test_helper/common
 
 @test "混合场景: 一加一删一保持" {
   run compute_port_actions "80/tcp 8080/tcp" "80/tcp 9000/udp" ""
-  # ADD 含 8080/tcp, DEL 含 9000/udp, 80/tcp 不出现
-  [[ "$output" == *"ADD:8080/tcp"* ]]
-  [[ "$output" == *"DEL:9000/udp"* ]]
-  [[ "$output" != *"80/tcp"* ]]
+  local expected="$output"
+  [[ "$expected" == *"ADD:8080/tcp"* ]]
+  [[ "$expected" == *"DEL:9000/udp"* ]]
+  # 80/tcp 保持: 不应出现整行 ADD:80/tcp 或 DEL:80/tcp
+  if grep -qx "ADD:80/tcp" <<<"$expected"; then echo "unexpected ADD:80/tcp"; return 1; fi
+  if grep -qx "DEL:80/tcp" <<<"$expected"; then echo "unexpected DEL:80/tcp"; return 1; fi
 }
 
 @test "v6/v4 后缀 key 精确匹配不误伤" {

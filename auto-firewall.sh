@@ -222,6 +222,29 @@ ss_listen_raw() {
     fi
 }
 
+# 差分计算（spec §3.3）: 入参为空格分隔的 canon key 集合
+# 输出逐行 "ADD:<key>" / "DEL:<key>"; 白名单与 SSH(22) 永不回收, 白名单不重复 ADD
+compute_port_actions() {
+    local cur="$1" prev="$2" wl="$3"
+    local -A in_cur=() in_prev=() in_wl=()
+    local k base
+    for k in $cur;  do in_cur["$k"]=1;  done
+    for k in $prev; do in_prev["$k"]=1; done
+    for k in $wl;   do in_wl["$k"]=1;   done
+    for k in $cur; do
+        [[ -n "${in_wl[$k]:-}" ]] && continue
+        [[ -n "${in_prev[$k]:-}" ]] && continue
+        echo "ADD:$k"
+    done
+    for k in $prev; do
+        [[ -n "${in_cur[$k]:-}" ]] && continue
+        [[ -n "${in_wl[$k]:-}" ]] && continue
+        base="${k%%/*}"
+        [[ "$base" == "22" ]] && continue          # SSH 保护
+        echo "DEL:$k"
+    done
+}
+
 check_root() {
     if [[ $EUID -ne 0 ]]; then
         echo "错误: 此脚本必须以 root 身份执行，请使用 sudo。" >&2
