@@ -1531,40 +1531,41 @@ CRONEOF
 
 #---- 帮助信息 ----------------------------------------------------------------
 show_help() {
-    cat <<'EOF'
-防火墙自动管理脚本 - auto-firewall.sh
+    cat <<EOF
+防火墙自动管理脚本 auto-firewall.sh v${SCRIPT_VERSION}
 
-用法: sudo bash auto-firewall.sh <命令>
+用法: sudo bash auto-firewall.sh <命令> [全局flag]
+     或安装后直接敲快捷命令: x [命令]（替代 sudo bash auto-firewall.sh）
 
 命令:
-  install        安装脚本（创建目录、配置cron、首次初始化）
-  port-check     扫描端口并自动放行/回收（通常由 cron 调用）
-  fail2ban-check 检测Fail2ban状态、同步IP白名单（通常由 cron 调用）
-  cleanup        系统清理 + 日志轮转（通常由 cron 调用）
-  status         查看当前 ufw/Fail2ban 状态和白名单
-  help           显示此帮助信息
+  install                安装(目录/迁移/dialog/快捷命令/cron/首次初始化)
+  menu                   打开 dialog 图形管理界面(需 TTY; 非交互降级为帮助)
+  port-check             扫描端口并自动放行/回收
+  fail2ban-check         检测 Fail2ban, 幂等同步 jail 配置
+  cleanup                系统清理 + 日志/备份轮转
+  status                 文本状态总览
+  config add <port|ip> V 新增白名单条目(经 v2 校验/去重/备份)
+  config del <port|ip> V 删除条目(SSH/内置默认 IP 受保护不可删)
+  config list [ports|ip] 查看白名单
+  config edit [ports|ip] 用 \$EDITOR 编辑, 保存前逐行校验
+  reset-config [范围]     恢复默认配置 all|ports|ip|fail2ban(备份+确认)
+  ban <IP>               手动封禁(fail2ban 在线走 jail, 否则 ufw deny)
+  unban <IP>             解除手动封禁
+  version                版本与依赖信息
+  log [N]                查看最近 N 行日志(默认100)
+  uninstall              卸载(默认不动系统防火墙); --purge 含 ufw/fail2ban/docker 足迹
+  help                   本帮助
 
-文件:
-  /opt/auto-firewall/auto-firewall.sh    主脚本
-  /opt/auto-firewall/port-whitelist.conf 端口白名单
-  /opt/auto-firewall/ip-whitelist.conf   IP 白名单（不会被自动封禁）
-  /opt/auto-firewall/ports.state         自动管理的端口状态
-  /opt/auto-firewall/logs/               日志目录
+全局 flag(可在命令前/后): --dry-run(只记录不执行,[DRYRUN]日志) --yes/-y(免交互确认)
+  uninstall 专用: --purge --force-ssh(连 SSH 规则一起删, 危险)
 
-端口白名单格式:
-  端口号/协议  # 服务名称
-  22/tcp       # SSH
-  443/tcp      # HTTPS
+端口白名单 v2 语法(保留 v1 兼容):
+  22/tcp            双栈 SSH    | 8000:8100/tcp  端口区间
+  443/tcp/v6        仅 IPv6     | icmp 或 -/esp  无端口协议
 
-IP 白名单格式:
-  IP地址/CIDR  # 说明
-  1.2.3.4      # 公司出口IP
-  10.0.0.0/8   # 内网段
-
-Cron 定时:
-  */5  * * * *  port-check     (每5分钟检测端口)
-  */15 * * * *  fail2ban-check (每15分钟检测Fail2ban)
-  0    * * * *  cleanup        (每小时清理)
+文件: /opt/auto-firewall/{auto-firewall.sh,port-whitelist.conf,ip-whitelist.conf,ports.state,.schema_version,backup/,logs/}
+Cron: */5 port-check | */15 fail2ban-check | 0 * cleanup
+卸载提示: 默认档后系统级 ufw/fail2ban 仍在生效, 需停用请用 uninstall --purge
 EOF
 }
 

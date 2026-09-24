@@ -15,3 +15,9 @@ Thumbs.db
 # Temp
 *.tmp
 *.temp
+*.tmp.*
+*.mig.*
+
+# 运行时备份/迁移产物
+backup/
+*.jail.tmp.*
