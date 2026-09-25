@@ -1333,4 +1333,3 @@ wsl -d Debian -- bash -lc 'sudo bash auto-firewall.sh status'
 | §8 uninstall | T12 |
 | §9 flag/version/log | T4, T11 |
 | §10 测试 | 各 task + T15 |
-

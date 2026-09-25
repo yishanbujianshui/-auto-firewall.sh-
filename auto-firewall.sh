@@ -429,11 +429,11 @@ init_ip_whitelist() {
 # schema-version: 2
 # ============================================
 # 防火墙自动脚本 - IP 白名单配置
-# 
+#
 # 格式: IP地址或CIDR网段  # 说明
 # 示例: 1.2.3.4            # 公司出口IP
 #       10.0.0.0/8          # 内网地址段
-# 
+#
 # 白名单中的 IP 不会被 Fail2ban 自动封禁。
 # 支持 IPv4/IPv6 及 CIDR 网段格式。
 # 一行一个 IP 或网段，# 开头为注释。
@@ -923,9 +923,9 @@ init_fail2ban() {
         cat > "$ufw_action" <<'UFWACT'
 # Fail2ban UFW action - 通过 ufw 封禁/解封 IP
 [Definition]
-actionstart  = 
-actionstop   = 
-actioncheck  = 
+actionstart  =
+actionstop   =
+actioncheck  =
 actionban    = ufw insert 1 deny from <ip> to any comment 'fail2ban-<name>'
 actionunban  = ufw delete deny from <ip> to any comment 'fail2ban-<name>'
 UFWACT
