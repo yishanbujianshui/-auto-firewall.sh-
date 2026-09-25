@@ -3,6 +3,7 @@
 set -u
 cd "$(dirname "$0")/.." || exit 1
 S="$PWD/auto-firewall.sh"
+VER="$(awk -F'"' '/^readonly SCRIPT_VERSION=/{print $2}' "$S")"   # 版本断言随脚本演进, 不再硬编码
 PASS=0; FAIL=0
 ck() { # ck 描述 命令
     if eval "$2" >/dev/null 2>&1; then echo "PASS: $1"; PASS=$((PASS+1));
@@ -13,6 +14,16 @@ tui() { # tui 按键序列 -> 输出落盘 /root/O_last（避免 eval 二次展�
 }
 
 echo "########## A. 环境重置 + install ##########"
+# WSL 环境自愈: Docker Desktop 开机向 WSL 内核注入 iptables-legacy 表, 使 nf_tables 版
+# iptables 输出附加 "# Warning: iptables-legacy tables present" 警告行, 破坏 ufw 的解析
+# (表现为 ufw status 空输出/enable 失败, ban 类断言全部误报)。卸载并重新加载 legacy 模块
+# 即清空残留表; 仅在测试机执行, 会丢弃 legacy 表内容。
+if lsmod 2>/dev/null | grep -qE '^iptable_(filter|nat)'; then
+    rmmod iptable_security iptable_raw iptable_mangle iptable_nat iptable_filter ip_tables \
+          ip6table_security ip6table_raw ip6table_mangle ip6table_nat ip6table_filter ip6_tables 2>/dev/null || true
+    modprobe ip_tables 2>/dev/null || true
+    modprobe ip6_tables 2>/dev/null || true
+fi
 rm -rf /opt/auto-firewall /etc/profile.d/auto-firewall.sh /etc/fail2ban/jail.local
 sed -i '/# BEGIN auto-firewall/,/# END auto-firewall/d' /etc/crontab
 ufw --force reset >/dev/null 2>&1; ufw enable >/dev/null 2>&1
@@ -26,7 +37,7 @@ ck "SSH探测=5522(本机真实)" "bash -c 'source $S; [ \"\$(detect_ssh_ports)\
 
 echo "########## B. 全部 CLI 命令 ##########"
 ck "status" "bash $S status | grep -q '运行状态'"
-ck "version 2.1.0" "bash $S version | grep -q '2.1.0'"
+ck "version $VER" "bash $S version | grep -q \"$VER\""
 ck "log" "bash $S log 5 >/dev/null"
 ck "help" "bash $S help | grep -q 'config'"
 ck "port-check" "bash $S port-check >/dev/null"
@@ -65,7 +76,7 @@ tui '3\n\nq';   ck "键3 Fail2ban检测" "grep -q 'Fail2ban' /root/O_last"
 tui '4\n\nq';   ck "键4 系统清理" "grep -q '系统清理完成' /root/O_last"
 tui '8\n\nq';   ck "键8 实时日志" "grep -q '实时日志' /root/O_last"
 tui '9\n\nq';   ck "键9 Dry-run演练" "grep -q 'Dry-run' /root/O_last"
-tui 'a\n\nq';   ck "键a 版本信息" "grep -q '2.1.0' /root/O_last"
+tui 'a\n\nq';   ck "键a 版本信息" "grep -q '$VER' /root/O_last"
 tui '6n';       ck "键6 恢复默认: n 取消" "grep -qE '已取消|非交互' /root/O_last && grep -q 'schema-version' /opt/auto-firewall/port-whitelist.conf"
 tui 'xn';       ck "键x 卸载: n 取消(未删)" "grep -qE '已取消|非交互' /root/O_last && test -d /opt/auto-firewall"
 tui '516011/tcp\n\nqq'; ck "子菜单5-1 添加端口6011" "grep -q '^6011/tcp' /opt/auto-firewall/port-whitelist.conf"

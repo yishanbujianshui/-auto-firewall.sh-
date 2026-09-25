@@ -1,6 +1,7 @@
 #!/usr/bin/env bats
 # shellcheck disable=SC1091,SC2016,SC2034,SC2153,SC2317
 # T7: 版本化无损迁移（spec §4, GAP-1）
+bats_require_minimum_version 1.5.0
 
 load test_helper/common
 
@@ -84,4 +85,33 @@ setup() {
     run_migrations
     grep -qx '2' "$VERSION_FILE"
     [ ! -f "$WHITELIST_FILE" ]
+}
+
+# ---- v1 孤儿动态规则收编（实机事故: v1 残留数千条规则永不回收）----
+@test "迁移收编: ufw 残留的 auto-firewall 孤儿规则并入 state" {
+    refresh_ufw_table() {
+        UFW_EXIST["9000/tcp"]=1;  UFW_MARKER["9000/tcp"]=auto-firewall
+        UFW_EXIST["7777/udp/v6"]=1; UFW_MARKER["7777/udp/v6"]=auto-firewall
+    }
+    migrate_v1_to_v2
+    grep -qx '9000/tcp' "$STATE_FILE"
+    grep -qx '7777/udp/v6' "$STATE_FILE"
+}
+
+@test "迁移收编: whitelist/manual 标记的规则不收编" {
+    refresh_ufw_table() {
+        UFW_EXIST["80/tcp"]=1; UFW_MARKER["80/tcp"]=auto-firewall-whitelist
+        UFW_EXIST["3306/tcp"]=1; UFW_MARKER["3306/tcp"]=none
+    }
+    migrate_v1_to_v2
+    run ! grep -qx '80/tcp' "$STATE_FILE"
+    run ! grep -qx '3306/tcp' "$STATE_FILE"
+}
+
+@test "迁移收编: 与 state 已有条目不重复" {
+    refresh_ufw_table() {
+        UFW_EXIST["3000/tcp"]=1; UFW_MARKER["3000/tcp"]=auto-firewall
+    }
+    migrate_v1_to_v2
+    [ "$(grep -c '^3000/tcp$' "$STATE_FILE")" -eq 1 ]
 }

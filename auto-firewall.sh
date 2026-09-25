@@ -9,7 +9,7 @@ set -euo pipefail
 
 #---- 全局配置 ----------------------------------------------------------------
 # 版本与 schema（spec §4.1）
-readonly SCRIPT_VERSION="2.1.0"
+readonly SCRIPT_VERSION="2.2.0"
 readonly STATE_SCHEMA_VERSION=2
 # 路径基址: 支持 AUTO_FW_HOME 环境变量覆盖（bats 测试隔离用, spec §2.6 GAP-A）
 SCRIPT_DIR="${AUTO_FW_HOME:-/opt/auto-firewall}"
@@ -18,6 +18,7 @@ WHITELIST_FILE="${SCRIPT_DIR}/port-whitelist.conf"
 FIRST_RUN_MARK="${SCRIPT_DIR}/.first_run_done"
 LOG_DIR="${SCRIPT_DIR}/logs"
 LOG_FILE="${LOG_DIR}/auto-firewall.log"
+CRON_LOG_FILE="${LOG_DIR}/cron.log"      # cron 重定向日志(不经 _log, 需单独轮转)
 LOCK_FILE="${SCRIPT_DIR}/.script.lock"
 IP_WHITELIST_FILE="${SCRIPT_DIR}/ip-whitelist.conf"
 VERSION_FILE="${SCRIPT_DIR}/.schema_version"
@@ -302,17 +303,18 @@ detect_port_scanner() {
     fi
 }
 
-# 日志轮转
+# 日志轮转（auto-firewall.log 与 cron.log 共用阈值; cron.log 由 cron `>>` 追加, 每次独立打开文件, 替换安全）
 rotate_log() {
-    if [[ -f "$LOG_FILE" ]]; then
-        local size
-        size=$(stat -c%s "$LOG_FILE" 2>/dev/null || stat -f%z "$LOG_FILE" 2>/dev/null || echo 0)
+    local f size
+    for f in "$LOG_FILE" "$CRON_LOG_FILE"; do
+        [[ -f "$f" ]] || continue
+        size=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo 0)
         if [[ $size -gt $MAX_LOG_SIZE ]]; then
-            tail -n "$LOG_RETAIN_LINES" "$LOG_FILE" > "${LOG_FILE}.tmp"
-            mv "${LOG_FILE}.tmp" "$LOG_FILE"
-            _info "日志已轮转（超过 1MB，已截断至最后 ${LOG_RETAIN_LINES} 行）"
+            tail -n "$LOG_RETAIN_LINES" "$f" > "${f}.tmp"
+            mv "${f}.tmp" "$f"
+            _info "日志已轮转（超过 1MB，已截断至最后 ${LOG_RETAIN_LINES} 行）: $(basename "$f")"
         fi
-    fi
+    done
 }
 
 # 非阻塞文件锁
@@ -351,6 +353,29 @@ backup_configs() {
     echo "$dst"
 }
 
+# v1 升级时将 ufw 中残留的 auto-firewall 动态规则“收编”进 state:
+# v2 回收是 state 驱动的(compute_port_actions 以 prev=state 做差分),
+# 若不收编, 这些孤儿规则永远不会被清理（实机观察: v1 可残留数千条）
+adopt_v1_orphan_rules() {
+    [[ -f "$STATE_FILE" ]] || return 0
+    refresh_ufw_table
+    local wl prev k added=0
+    wl=" $(read_whitelist 2>/dev/null | tr '\n' ' ') "
+    prev=" $(grep -v '^#' "$STATE_FILE" 2>/dev/null | tr '\n' ' ') "
+    for k in "${!UFW_MARKER[@]}"; do
+        [[ "${UFW_MARKER[$k]}" == "auto-firewall" ]] || continue
+        [[ "$prev" == *" $k "* ]] && continue
+        [[ "$wl" == *" $k "* ]] && continue
+        printf '%s\n' "$k" >> "$STATE_FILE"
+        prev="${prev}${k} "
+        added=$((added+1))
+    done
+    if (( added )); then
+        _info "已收编 ${added} 条 v1 遗留的孤儿动态规则（下次 port-check 按差分决定回收）"
+    fi
+    return 0
+}
+
 # v1 -> v2: 白名单/state 换发为 v2 语法; 注释与无法解析的行原样保留（GAP-1）
 migrate_v1_to_v2() {
     backup_configs >/dev/null || { _err "备份失败, 中止迁移"; return 1; }
@@ -383,6 +408,7 @@ migrate_v1_to_v2() {
             done < "$STATE_FILE"
         } > "$tmps" && mv "$tmps" "$STATE_FILE"
     fi
+    adopt_v1_orphan_rules
     echo "$STATE_SCHEMA_VERSION" > "$VERSION_FILE"
     _info "配置已从 v1 迁移至 v2"
 }
@@ -1321,16 +1347,36 @@ init_ufw() {
 }
 
 #---- Docker + UFW 兼容性修复 ------------------------------------------------
+# dockerd 是否真实运行: CLI 存在≠守护进程存在。after.rules 中引用未创建的
+# DOCKER-USER 链会导致 iptables-restore 失败、ufw 开机无法加载（实机事故）
+docker_daemon_running() {
+    [[ -S /var/run/docker.sock ]] || pgrep -x dockerd &>/dev/null
+}
+
 fix_docker_ufw() {
+    local AFTER_RULES="${UFW_ETC_DIR}/after.rules"
+    local MARKER="# BEGIN auto-firewall DOCKER-USER fix"
+    local MARKER_END="# END auto-firewall DOCKER-USER fix"
+
     if ! command -v docker &>/dev/null; then
         _info "未检测到 Docker，跳过 Docker/UFW 兼容性修复。"
         return 0
     fi
 
-    _info "检测到 Docker，正在修复 Docker 绕过 UFW 的安全问题..."
+    # CLI 在但守护进程不在: 不插入修复, 并清理历史失效块,
+    # 避免 after.rules 依赖 dockerd 永不创建的 DOCKER-USER 链而拖垮 ufw
+    if ! docker_daemon_running; then
+        _info "Docker 守护进程未运行，跳过 Docker/UFW 兼容性修复。"
+        if [[ -f "$AFTER_RULES" ]] && grep -qF "$MARKER" "$AFTER_RULES"; then
+            cp "$AFTER_RULES" "${AFTER_RULES}.bak.$(date +%Y%m%d%H%M%S)"
+            sed -i "\|^${MARKER}$|,\|^${MARKER_END}$|d" "$AFTER_RULES"
+            ufw_exec reload >/dev/null 2>&1 || true
+            _info "已移除失效的 Docker/UFW 修复块（守护进程已不存在）。"
+        fi
+        return 0
+    fi
 
-    local AFTER_RULES="/etc/ufw/after.rules"
-    local MARKER="# BEGIN auto-firewall DOCKER-USER fix"
+    _info "检测到 Docker，正在修复 Docker 绕过 UFW 的安全问题..."
 
     # 已经修复过则跳过
     if grep -qF "$MARKER" "$AFTER_RULES" 2>/dev/null; then
@@ -1342,16 +1388,18 @@ fix_docker_ufw() {
     cp "$AFTER_RULES" "${AFTER_RULES}.bak.$(date +%Y%m%d%H%M%S)"
 
     # 在 *filter 段末尾（COMMIT 之前）插入 DOCKER-USER 链规则
-    # 这样 UFW 规则对 Docker 暴露的端口也能生效
+    # 这样 UFW 规则对 Docker 暴露的端口也能生效;
+    # 自声明 :DOCKER-USER 链, 避免 ufw 先于 dockerd 加载时因链缺失而失败
     local insert_rules="${MARKER}
 # 让 DOCKER-USER 链接受 UFW 的过滤规则，修复 Docker 端口绕过 UFW 的问题
+:DOCKER-USER - [0:0]
 :ufw-user-input - [0:0]
 -A DOCKER-USER -j ufw-user-input
 -A DOCKER-USER -j RETURN
-# END auto-firewall DOCKER-USER fix"
+${MARKER_END}"
 
     # 在 *filter 段的 COMMIT 之前插入
-    if grep -q '^*filter' "$AFTER_RULES"; then
+    if grep -q '^\*filter' "$AFTER_RULES"; then
         awk -v rules="$insert_rules" '
             /^COMMIT/ && in_filter { print rules; in_filter=0 }
             /^\*filter/ { in_filter=1 }
@@ -1364,7 +1412,7 @@ fix_docker_ufw() {
     fi
 
     # 重启 ufw 应用更改
-    ufw reload &>/dev/null || true
+    ufw_exec reload >/dev/null 2>&1 || true
     _info "Docker/UFW 兼容性修复完成。"
 }
 
@@ -1613,7 +1661,7 @@ cleanup() {
         _info "/tmp 清理了 ${tmp_cleaned} 个过期临时文件。"
     fi
 
-    # 5. 脚本自身日志轮转
+    # 5. 脚本自身日志轮转（auto-firewall.log + cron.log）
     rotate_log
 
     # 6. Fail2ban 日志轮转（>10MB 截断至最后 2000 行）
@@ -1805,8 +1853,8 @@ do_install() {
     fi
 
     # 确保日志文件存在
-    touch "$LOG_FILE" "${LOG_DIR}/cron.log"
-    chmod 644 "$LOG_FILE" "${LOG_DIR}/cron.log"
+    touch "$LOG_FILE" "$CRON_LOG_FILE"
+    chmod 644 "$LOG_FILE" "$CRON_LOG_FILE"
 
     # 首次初始化 ufw
     if [[ ! -f "$FIRST_RUN_MARK" ]]; then

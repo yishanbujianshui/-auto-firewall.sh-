@@ -1,5 +1,16 @@
 # 更新日志
 
+## v2.2.0（2026-09-25）
+
+### 修复
+- **Docker/UFW 修复改为守护进程级检测**：此前仅凭 `command -v docker` 判断，导致 Docker 引擎被卸载、CLI 残留的机器上 after.rules 引用永不存在的 `DOCKER-USER` 链，iptables-restore 整体失败、ufw 开机无法加载（实机事故：防火墙静默失效 3 个多月，Fail2ban 封禁形同虚设）。现在：守护进程未运行时跳过插入，并自动清理历史失效修复块（先备份）；新插入块自声明 `:DOCKER-USER - [0:0]` 链，彻底消除加载顺序依赖。
+- **cron.log 纳入日志轮转**：`rotate_log` 此前只处理 `auto-firewall.log`，cron `>>` 重定向的 `cron.log` 无人管理可无限增长（实机观察 20MB）；现与主日志共用 1MB/500 行阈值。
+- **v1→v2 迁移收编孤儿动态规则**：v2 回收是 state 驱动的，v1 遗留的 `comment=auto-firewall` 规则不在 state 中则永不回收（实机残留 3552 条）。迁移时新增 `adopt_v1_orphan_rules`，扫描 ufw 现存带标规则并入 state，由下一次 port-check 按差分决定回收。
+
+### 变更
+- `fix_docker_ufw` 路径改用 `AUTO_FW_UFW_ETC_DIR` seam（可测试），`ufw reload` 改走 `ufw_exec`（支持 dry-run）。
+- 新增 bats 用例：`tests/docker_fix.bats`（4 项）、`tests/log_rotation.bats`（3 项）、`tests/migration.bats` 补充迁移收编（3 项）。
+
 ## v2.1.0（2026-09-25）
 
 ### 新增 / 变更

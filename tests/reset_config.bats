@@ -12,7 +12,9 @@ setup() {
     export UFW_LOG="$AUTO_FW_HOME/ufw.calls"; : > "$UFW_LOG"
     printf '#!/usr/bin/env bash\ncase "$*" in\n *-tln*) printf "Netid State Recv-Q Send-Q Local Address:Port Peer\\ntcp LISTEN 0 128 0.0.0.0:22 0.0.0.0:*\\ntcp LISTEN 0 511 0.0.0.0:8081 0.0.0.0:*\\n";;\n *-uln*) printf "Netid State Recv-Q Send-Q Local Address:Port Peer\\n";;\n *) :;;\nesac\n' > "$STUB/ss"
     printf '#!/usr/bin/env bash\ncase "$1" in status) echo "Status: active";; *) echo "ufw $*" >> "${UFW_LOG:-/dev/null}";; esac\n' > "$STUB/ufw"
-    chmod +x "$STUB/ss" "$STUB/ufw"
+    # 桩 fail2ban-client: 若宿主机真实 f2ban active, ban_ip 会改走 f2ban 分支导致 UFW_LOG 断言不稳定
+    printf '#!/usr/bin/env bash\nexit 1\n' > "$STUB/fail2ban-client"
+    chmod +x "$STUB/ss" "$STUB/ufw" "$STUB/fail2ban-client"
     # shellcheck source=/dev/null
     source "${BATS_TEST_DIRNAME}/../auto-firewall.sh"
     LOCK_FILE="$AUTO_FW_HOME/.script.lock"
