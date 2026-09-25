@@ -6,6 +6,9 @@ setup() {
     export AUTO_FW_HOME
     AUTO_FW_HOME="$(mktemp -d)"
     mkdir -p "$AUTO_FW_HOME/logs"
+    # SSH 探测 seam: 固定为 22, 不依赖宿主机真实 sshd_config
+    export AUTO_FW_SSHD_CONFIG="$AUTO_FW_HOME/sshd_config"
+    printf 'Port 22\n' > "$AUTO_FW_SSHD_CONFIG"
     # shellcheck source=/dev/null
     source "${BATS_TEST_DIRNAME}/../auto-firewall.sh"
     printf '# schema-version: 2\n# 头注释\n' > "$WHITELIST_FILE"

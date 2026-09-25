@@ -1,5 +1,16 @@
 # 更新日志
 
+## v2.1.0（2026-09-25）
+
+### 新增 / 变更
+- **SSH 端口自动探测**：不再写死 22。保护范围 = sshd_config 的 `Port` 指令 ∪ 实际监听且进程名含 sshd 的端口，均无结果时回退 22；适用于回收/白名单删除/purge 三处保护点。
+- **TUI 改为原生 ANSI 实现，彻底移除 dialog 依赖**：方向键/j k 导航、数字/字母快捷执行、Enter 确认、q 退出；msgbox/inputbox/confirm/编辑均自绘；install 不再安装 dialog；非交互终端仍降级为文本帮助。
+- 测试 seam `AUTO_FW_TUI_TEST=1` 支持 bats 管道驱动 TUI（新增按键映射/菜单渲染/导航/确认等 9 项用例）。
+- `config edit`/`tui_edit_file` 健壮性：mktemp 失败/空路径 fail-fast，编辑器非零退出不保存（防误截断配置文件）。
+
+### 修复
+- 清除全部 10 条 shellcheck style 级告警（SC2155/SC2034/SC2129/SC2001/SC2015×2 等）；`shellcheck -S style` 现 0 违规。
+
 ## v2.0.0（2026-09-24）
 
 ### 新增

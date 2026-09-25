@@ -18,6 +18,9 @@ setup() {
     export AUTO_FW_F2B_ACTION_DIR="$AUTO_FW_HOME/f2b/action.d"
     export AUTO_FW_UFW_ETC_DIR="$AUTO_FW_HOME/f2b/ufw"
     export AUTO_FW_UNINSTALL_ROOT="$FAKE_ROOT"
+    # SSH 探测 seam: 固定 22, 不依赖宿主机
+    export AUTO_FW_SSHD_CONFIG="$AUTO_FW_HOME/sshd_config"
+    printf 'Port 22\n' > "$AUTO_FW_SSHD_CONFIG"
     mkdir -p "$AUTO_FW_F2B_FILTER_DIR" "$AUTO_FW_F2B_ACTION_DIR" "$AUTO_FW_UFW_ETC_DIR"
 
     # 假 /etc: crontab 含托管区块 + profile.d 含快捷脚本

@@ -12,7 +12,7 @@
 | Docker 兼容修复 | 自动修补 Docker 绕过 UFW 的安全漏洞（iptables DOCKER-USER 链） |
 | Fail2ban 联动 | sshd + nginx 多 jail（日志归位 access/error），无 MTA 自动降级为纯封禁 |
 | **无损升级** | 配置带 `schema-version`，升级时逐级迁移 + 自动备份 + 失败还原，旧配置零损坏 |
-| **TUI 管理界面** | `dialog` 图形菜单：仪表盘/检测/清理/配置/日志/Dry-run 演练等 |
+| **TUI 管理界面** | **原生 ANSI 实现（零外部依赖）**：仪表盘/检测/清理/配置/日志/Dry-run 演练等，方向键+数字快捷操作 |
 | **快捷命令 `x`** | `x` 打开管理界面；`x <子命令>` 完全替代 `sudo bash auto-firewall.sh <子命令>` |
 | **配置管理** | `config add/del/list/edit` 白名单增删查改（校验+去重+保护+备份），`reset-config` 恢复默认 |
 | **手动封禁** | `ban <IP>` / `unban <IP>` |
@@ -22,7 +22,7 @@
 ## 快速开始
 
 ```bash
-# 一键安装（自动迁移旧配置、装 dialog、写快捷命令、配置 cron、初始化 UFW/Fail2ban）
+# 一键安装（自动迁移旧配置、写快捷命令、配置 cron、初始化 UFW/Fail2ban；TUI 原生实现无需 dialog）
 sudo bash auto-firewall.sh install
 ```
 
@@ -92,7 +92,7 @@ x uninstall --purge      # 彻底档：另删脚本加的 ufw 规则(22 默认�
                          #   非交互须加 --yes；删前备份移至 /root/auto-firewall-uninstall-backup-*
 ```
 
-软件包（ufw/fail2ban/dialog）默认不卸载，如需：`sudo apt-get remove --purge ufw fail2ban dialog`。
+软件包（ufw/fail2ban）默认不卸载，如需：`sudo apt-get remove --purge ufw fail2ban`。
 
 ## 测试
 
@@ -101,10 +101,10 @@ x uninstall --purge      # 彻底档：另删脚本加的 ufw 规则(22 默认�
 bash tests/run.sh
 
 # 端到端：需在 Linux（如 WSL Debian）执行
-sudo apt-get install -y dialog bats shellcheck ufw fail2ban iproute2
+sudo apt-get install -y bats shellcheck ufw fail2ban iproute2
 ```
 
-Windows 下仅编辑代码；`ufw/ss/dialog` 相关测试必须在 Linux 跑。
+Windows 下仅编辑代码；`ufw/ss` 相关测试必须在 Linux 跑。
 
 ## 兼容性
 
@@ -114,7 +114,7 @@ Debian 12 (bookworm) ✅ / Ubuntu 22.04+ ✅ / Ubuntu 24.04 ✅；其他 Debian 
 
 1. 安装后立即把你的可信公网 IP 加入 `ip-whitelist.conf`（或 `x config add ip <IP>`），防 Fail2ban 误封；
 2. 破坏性操作先用 `--dry-run` 演练（日志有 `[DRYRUN]` 前缀）；
-3. 建议配合 SSH 密钥登录；脚本对 22 端口有"永不回收 / 不可移出白名单 / purge 默认不删"三重保护；
+3. 建议配合 SSH 密钥登录；SSH 保护端口为**自动探测**（sshd_config 的 Port 指令 + 实际监听的 sshd 进程，均无结果时回退 22），自定义端口的用户同样受“永不回收 / 不可移出白名单 / purge 默认不删”三重保护；
 4. TUI 中文界面依赖 UTF-8 locale（脚本会自动尝试 `C.UTF-8`，失败时按提示 `dpkg-reconfigure locales`）。
 
 ## License

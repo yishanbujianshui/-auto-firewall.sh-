@@ -79,7 +79,7 @@ teardown() { rm -rf "$AUTO_FW_HOME" "$STUB"; }
 
 @test "show_version 含版本与 schema" {
     run show_version
-    [[ "$output" == *"2.0.0"* ]]
+    [[ "$output" == *"${SCRIPT_VERSION}"* ]]
     [[ "$output" == *"schema"* ]]
 }
 

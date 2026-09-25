@@ -9,7 +9,7 @@ set -euo pipefail
 
 #---- 全局配置 ----------------------------------------------------------------
 # 版本与 schema（spec §4.1）
-readonly SCRIPT_VERSION="2.0.0"
+readonly SCRIPT_VERSION="2.1.0"
 readonly STATE_SCHEMA_VERSION=2
 # 路径基址: 支持 AUTO_FW_HOME 环境变量覆盖（bats 测试隔离用, spec §2.6 GAP-A）
 SCRIPT_DIR="${AUTO_FW_HOME:-/opt/auto-firewall}"
@@ -30,6 +30,7 @@ FAIL2BAN_FILTER_DIR="${AUTO_FW_F2B_FILTER_DIR:-/etc/fail2ban/filter.d}"
 FAIL2BAN_ACTION_DIR="${AUTO_FW_F2B_ACTION_DIR:-/etc/fail2ban/action.d}"
 UFW_DEFAULT_FILE="${AUTO_FW_UFW_DEFAULT:-/etc/default/ufw}"
 NGINX_LOG_DIR="${AUTO_FW_NGINX_LOG_DIR:-/var/log/nginx}"
+SSHD_CONFIG_FILE="${AUTO_FW_SSHD_CONFIG:-/etc/ssh/sshd_config}"
 readonly F2B_BANTIME=3600                     # 封禁时长（秒），默认1小时
 readonly F2B_FINDTIME=600                     # 统计窗口（秒），默认10分钟
 readonly F2B_MAXRETRY=5                       # 最大重试次数
@@ -42,7 +43,7 @@ _log()  { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" | tee -a "$LOG_FILE" || true;
 _err()  { _log "[ERROR] $*" >&2; }
 _info() { _log "[INFO]  $*"; }
 
-# 强制 UTF-8 locale，保 dialog/日志中文不乱码（spec GAP-3）
+# 强制 UTF-8 locale，保 TUI/日志中文不乱码（spec GAP-3）
 ensure_locale_utf8() {
     case "${LC_ALL:-${LANG:-}}" in
         *[Uu][Tt][Ff]*8*) : ;;
@@ -225,10 +226,30 @@ ss_listen_raw() {
     fi
 }
 
-# 差分计算（spec §3.3）: 入参为空格分隔的 canon key 集合
-# 输出逐行 "ADD:<key>" / "DEL:<key>"; 白名单与 SSH(22) 永不回收, 白名单不重复 ADD
+# 探测 SSH 监听端口（不写死 22）: sshd_config 的 Port 指令 ∪ 实际监听且进程名含 sshd;
+# 均无结果时回退 22。输出空格分隔的端口列表。
+detect_ssh_ports() {
+    local ports="" p line raw parsed
+    if [[ -r "$SSHD_CONFIG_FILE" ]]; then
+        while IFS= read -r p; do
+            [[ "$p" =~ ^[0-9]+$ ]] && ports="${ports} ${p}"
+        done < <(awk 'tolower($1)=="port" && $2 ~ /^[0-9]+$/ {print $2}' "$SSHD_CONFIG_FILE" 2>/dev/null || true)
+    fi
+    raw="$(ss_probe -tlnp 2>/dev/null || netstat_probe -tlnp 2>/dev/null || true)"
+    while IFS= read -r line; do
+        [[ "$line" == *sshd* ]] || continue
+        parsed="$(parse_scan_line "$line")" || continue
+        ports="${ports} ${parsed%%|*}"
+    done <<<"$raw"
+    ports="$(printf '%s\n' $ports | grep -E '^[0-9]+$' | sort -un | tr '\n' ' ')"
+    [[ -z "${ports// /}" ]] && ports="22"
+    echo "$ports" | sed 's/[[:space:]]*$//'
+}
+
+# 差分计算（spec §3.3）: 入参为空格分隔的 canon key 集合; 第4参为 SSH 保护端口列表(默认 "22")
+# 输出逐行 "ADD:<key>" / "DEL:<key>"; 白名单与 SSH 端口永不回收, 白名单不重复 ADD
 compute_port_actions() {
-    local cur="$1" prev="$2" wl="$3"
+    local cur="$1" prev="$2" wl="$3" ssh_ports="${4:-22}"
     local -A in_cur=() in_prev=() in_wl=()
     local k base
     for k in $cur;  do in_cur["$k"]=1;  done
@@ -243,7 +264,7 @@ compute_port_actions() {
         [[ -n "${in_cur[$k]:-}" ]] && continue
         [[ -n "${in_wl[$k]:-}" ]] && continue
         base="${k%%/*}"
-        [[ "$base" == "22" ]] && continue          # SSH 保护
+        [[ " ${ssh_ports} " == *" ${base} "* ]] && continue   # SSH 端口保护（自适应探测）
         echo "DEL:$k"
     done
 }
@@ -260,7 +281,7 @@ check_debian_family() {
         _err "此脚本仅支持 Debian / Ubuntu 系统。"
         exit 1
     fi
-    _info "系统类型: $(cat /etc/os-release 2>/dev/null | grep '^PRETTY_NAME' | cut -d= -f2 | tr -d '"')"
+    _info "系统类型: $(grep '^PRETTY_NAME' /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"')"
 }
 
 # 检测端口扫描工具（ss 优先，不存在则回退 netstat）
@@ -316,7 +337,9 @@ backup_configs() {
     chmod 700 "$BACKUP_DIR" "$dst" 2>/dev/null || true
     local f
     for f in "$WHITELIST_FILE" "$STATE_FILE" "$IP_WHITELIST_FILE" "$VERSION_FILE"; do
-        [[ -f "$f" ]] && cp -a "$f" "$dst/" 2>/dev/null || true
+        if [[ -f "$f" ]]; then
+            cp -a "$f" "$dst/" 2>/dev/null || true
+        fi
     done
     # 保留策略: 目录名按时间戳降序, 删除超出部分
     local -a dirs=()
@@ -504,7 +527,10 @@ _wl_has_key() {
 config_del_port() {
     local k
     k="$(canon_key "${1:-}")" || { _err "非法端口描述符: ${1:-}"; return 1; }
-    [[ "${k%%/*}" == "22" ]] && { _err "SSH 端口不可移出白名单"; return 1; }
+    if [[ " $(detect_ssh_ports) " == *" ${k%%/*} "* ]]; then
+        _err "该端口为探测到的 SSH 端口, 不可移出白名单: $k"
+        return 1
+    fi
     local tmp="${WHITELIST_FILE}.tmp.$$"
     awk -v k="$k" '$1!=k' "$WHITELIST_FILE" > "$tmp"
     backup_configs >/dev/null || { rm -f "$tmp"; return 1; }
@@ -547,9 +573,16 @@ config_edit() {
     esac
     [[ -f "$file" ]] || { _err "配置文件不存在: $file"; return 1; }
     [[ -t 1 ]] || { _err "非交互终端, 请用 config add/del"; return 1; }
-    tmp="$(mktemp)"
-    cp "$file" "$tmp"
-    "${EDITOR:-nano}" "$tmp"
+    local tmp
+    tmp="$(mktemp)" || { _err "创建临时文件失败, 中止"; return 1; }
+    [[ -n "$tmp" && -f "$tmp" ]] || { _err "临时文件路径异常, 中止（不触碰配置）"; return 1; }
+    cp "$file" "$tmp" || { _err "复制副本失败, 中止"; rm -f "$tmp"; return 1; }
+    local erc=0
+    "${EDITOR:-nano}" "$tmp" || erc=$?
+    if (( erc )); then
+        _err "编辑器退出异常(rc=${erc}), 不保存"
+        rm -f "$tmp"; return 1
+    fi
     while IFS= read -r line || [[ -n "$line" ]]; do
         local t="${line#"${line%%[![:space:]]*}"}"
         [[ -z "$t" || "$t" == \#* ]] && continue
@@ -596,16 +629,16 @@ config_main() {
 }
 
 #---- 恢复默认 / 手动封禁 / 版本 / 日志（spec §7.2/§7.3/§9）----------------
-# 交互确认: ASSUME_YES 短路; dialog 仅在有 TTY 时; 否则拒绝（G8 安全默认）
+# 交互确认: ASSUME_YES 短路; 有 TTY 时原生 y/N 单键确认; 否则拒绝（G8 安全默认）
 confirm() {
     local prompt="$1"
     [[ "${ASSUME_YES:-0}" == "1" ]] && return 0
-    if command -v dialog &>/dev/null && [[ -t 1 ]]; then
-        dialog --title "确认" --yesno "$prompt" 12 60 2>/dev/null
-        return $?
+    if [[ -t 1 && -t 0 ]]; then
+        tui_confirm "确认" "$prompt"
+    else
+        _err "非交互环境需显式传 --yes 才能执行: ${prompt}"
+        return 1
     fi
-    _err "非交互环境需显式传 --yes 才能执行: ${prompt}"
-    return 1
 }
 
 # 恢复默认配置: 不卸载脚本、不改 schema; ports 靠“当前监听重扫”故不会关掉在用端口
@@ -663,7 +696,6 @@ show_version() {
     grep '^PRETTY_NAME' /etc/os-release 2>/dev/null | cut -d= -f2 | tr -d '"' | sed 's/^/系统: /' || true
     command -v ufw &>/dev/null && echo "ufw: $(ufw --version 2>/dev/null | head -1)" || echo "ufw: 未安装"
     command -v fail2ban-client &>/dev/null && echo "fail2ban: $(fail2ban-client --version 2>&1 | head -1)" || echo "fail2ban: 未安装"
-    command -v dialog &>/dev/null && echo "dialog: $(dialog --version 2>&1 | head -1)" || echo "dialog: 未安装"
 }
 
 show_log() {
@@ -699,14 +731,15 @@ restore_docker_after_rules() {
 # --purge 附加动作: 删脚本标记的 ufw 规则(SSH 保护)/还原 docker 修复/清理 fail2ban
 purge_firewall() {
     refresh_ufw_table
-    local k err=0
+    local k err=0 sshp
+    sshp="$(detect_ssh_ports)"
     local -a args
     for k in "${!UFW_EXIST[@]}"; do
         case "${UFW_MARKER[$k]:-none}" in
             auto-firewall|auto-firewall-whitelist|auto-firewall-manual) : ;;
             *) continue ;;
         esac
-        if [[ "${k%%/*}" == "22" && "$FORCE_SSH" != "1" ]]; then
+        if [[ " ${sshp} " == *" ${k%%/*} "* && "$FORCE_SSH" != "1" ]]; then
             _info "保留 SSH 规则: $k（确需删除请加 --force-ssh）"
             continue
         fi
@@ -739,7 +772,8 @@ uninstall() {
         purge_firewall || _err "部分防火墙残留清理失败, 继续卸载"
         # 卸载前备份移出被删目录, 长期保留（dry-run 不执行）
         if [[ "$DRY_RUN" != "1" && -z "$R" && -n "$keep" ]]; then
-            local dest="/root/auto-firewall-uninstall-backup-$(date +%Y%m%d%H%M%S)"
+            local dest
+            dest="/root/auto-firewall-uninstall-backup-$(date +%Y%m%d%H%M%S)"
             mkdir -p "$dest" && cp -a "$keep"/. "$dest/" \
                 && _info "卸载前备份已保存: $dest"
         fi
@@ -752,23 +786,126 @@ uninstall() {
     _info "卸载完成。提示: 系统级 ufw/fail2ban 仍在生效（封禁未停止）, 如需一并停用请改用 uninstall --purge（GAP-D）"
 }
 
-#---- 图形化管理界面 TUI（spec §6.3; 仅前端, 业务逻辑全部复用既有函数）------
+#---- 图形化管理界面 TUI（原生 ANSI 实现, 零外部依赖; 业务逻辑全部复用既有函数）----
 ufw_read() { ufw "$@" 2>/dev/null; }    # 只读查询, 不经 run_cmd
 
-tui_msg()  { dialog --backtitle "auto-firewall v${SCRIPT_VERSION}" --title "$1" --msgbox "$2" 18 72 2>/dev/null; }
-tui_input(){ dialog --title "$1" --inputbox "$2" 10 60 3>&1 1>&2 2>&3; }
-tui_dlg()  { dialog --clear --backtitle "auto-firewall v${SCRIPT_VERSION}" "$@" 3>&1 1>&2 2>&3; }
+# 主菜单定义（tag 与 tui_run 分支一致; 1-9 数字, a=版本, x=卸载, q=退出）
+TUI_TAGS=(1 2 3 4 5 6 7 8 9 a x q)
+TUI_NAMES=("总览仪表盘" "端口检测" "Fail2ban检测" "系统清理" "配置管理(增删/编辑)" "恢复默认配置" "封禁/解封 IP" "实时日志" "Dry-run 演练" "版本信息" "卸载脚本与配置" "退出")
 
-# 编辑对话框 + 逐行校验 + 非法行处理（spec §7.1 交互约定）
+_TUI_CFG_TAGS=(1 2 3 4 5 6 7 q)
+_TUI_CFG_NAMES=("添加端口白名单" "删除端口白名单" "添加 IP 白名单" "删除 IP 白名单" "查看当前白名单" "编辑端口白名单文件" "编辑 IP 白名单文件" "返回主菜单")
+
+_TUI_BAN_TAGS=(1 2 3 q)
+_TUI_BAN_NAMES=("封禁 IP" "解封 IP" "查看当前封禁" "返回主菜单")
+
+# 读一个按键 → 语义名: UP/DOWN/ENTER/ESC/EOF 或字符本身; 无输入(EOF/超时)输出 EOF 并返回1
+_tui_key() {
+    local k rest
+    if ! IFS= read -rsn1 k 2>/dev/null; then printf 'EOF'; return 1; fi
+    case "$k" in
+        $'\e')
+            rest=""
+            IFS= read -rsn2 -t 1 rest 2>/dev/null || true
+            case "$rest" in
+                '[A') printf 'UP' ;;
+                '[B') printf 'DOWN' ;;
+                *)    printf 'ESC' ;;
+            esac ;;
+        ''|' ') printf 'ENTER' ;;
+        $'\x03') printf 'ESC' ;;
+        k) printf 'UP' ;;
+        j) printf 'DOWN' ;;
+        *) printf '%s' "$k" ;;
+    esac
+}
+
+# 渲染菜单: $1=标题 $2=tags数组名 $3=names数组名 $4=选中下标
+_tui_render() {
+    local title="$1" tagsv="$2" namesv="$3" sel="$4" i w=62 line
+    local -n _tui_tags="$tagsv"
+    local -n _tui_names="$namesv"
+    local hr
+    hr="$(printf '─%.0s' $(seq 1 "$w"))"
+    printf '\033[2J\033[H'
+    printf '\033[1m┌%s\n│ %-*s │\n├%s\033[0m\n' "$hr" "$w" "$title" "$hr"
+    for ((i=0; i<${#_tui_tags[@]}; i++)); do
+        printf -v line ' %s) %s' "${_tui_tags[i]}" "${_tui_names[i]}"
+        if (( i == sel )); then
+            printf '\033[7m%s\033[0m\n' "$line"
+        else
+            printf '%s\n' "$line"
+        fi
+    done
+    printf '\033[1m└%s\033[0m\n' "$hr"
+    printf '\n\033[33m↑↓/j k 移动 · 数字/字母快捷执行 · Enter 执行 · q 退出\033[0m\n'
+}
+
+# 通用菜单循环: $1=标题 $2=tags名 $3=names名 $4=回调函数(入参=tag); 回调返回非0则退出循环
+_tui_menu_loop() {
+    local title="$1" tagsv="$2" namesv="$3" cb="$4"
+    local -n _loop_tags="$tagsv"
+    local sel=0 key i run
+    local n=${#_loop_tags[@]}
+    while true; do
+        _tui_render "$title" "$tagsv" "$namesv" "$sel"
+        key="$(_tui_key)" || return 0
+        run=""
+        case "$key" in
+            UP)    (( sel > 0 )) && sel=$((sel-1)) ;;
+            DOWN)  (( sel < n-1 )) && sel=$((sel+1)) ;;
+            ENTER) run="${_loop_tags[sel]}" ;;
+            q|Q|ESC) return 0 ;;
+            *)
+                for i in "${!_loop_tags[@]}"; do
+                    if [[ "${_loop_tags[i],,}" == "${key,,}" ]]; then
+                        sel=$i; run="${_loop_tags[i]}"; break
+                    fi
+                done ;;
+        esac
+        if [[ -n "$run" ]]; then
+            "$cb" "$run" || return 0
+        fi
+    done
+}
+
+tui_msg() { # $1=标题 $2=正文; Enter/任意键返回, EOF 安全
+    printf '\033[2J\033[H\033[1m── %s ──\033[0m\n%s\n\n\033[33m[Enter] 返回\033[0m' "$1" "$2"
+    _tui_key >/dev/null || true
+    return 0
+}
+
+tui_input() { # $1=标题 $2=提示; stdout=输入行; 空/EOF 返回1
+    printf '\033[2J\033[H\033[1m── %s ──\033[0m\n%s\n> ' "$1" "$2"
+    local v=""
+    IFS= read -r v 2>/dev/null || return 1
+    [[ -n "$v" ]] || return 1
+    printf '%s' "$v"
+}
+
+tui_confirm() { # $1=标题 $2=正文; y 返回0, 其它/EOF 返回1
+    printf '\033[2J\033[H\033[1m── %s ──\033[0m\n%s\n\n\033[33m确认? [y/N]\033[0m ' "$1" "$2"
+    local k=""
+    IFS= read -rsn1 k 2>/dev/null || { printf '\n(已取消)\n'; return 1; }
+    if [[ "$k" == [yY] ]]; then
+        return 0
+    fi
+    printf '\n(已取消)\n'
+    return 1
+}
+
+# 外部编辑器修改 + 逐行校验 + 非法行处理（spec §7.1 交互约定, 原生无外部依赖）
 tui_edit_file() {
     local which="${1:-ports}" file tmp out line t bad=0 badlist=""
     case "$which" in ports) file="$WHITELIST_FILE" ;; ip) file="$IP_WHITELIST_FILE" ;; *) return 1 ;; esac
-    tmp="$(mktemp)"
-    cat "$file" > "$tmp"
-    if ! out="$(tui_dlg --title "编辑 ${file}（保存前逐行校验）" --editbox "$tmp" 20 76)"; then
-        rm -f "$tmp"; return 0
+    tmp="$(mktemp)" || { _err "创建临时文件失败"; return 1; }
+    [[ -n "$tmp" && -f "$tmp" ]] || { _err "临时文件路径异常, 中止"; return 1; }
+    cat "$file" > "$tmp" || { rm -f "$tmp"; return 1; }
+    if ! "${EDITOR:-vi}" "$tmp"; then
+        _err "编辑器退出异常, 不保存"
+        rm -f "$tmp"; return 1
     fi
-    rm -f "$tmp"
+    out="$(cat "$tmp")"; rm -f "$tmp"
     while IFS= read -r line || [[ -n "$line" ]]; do
         t="${line#"${line%%[![:space:]]*}"}"
         [[ -z "$t" || "$t" == \#* ]] && continue
@@ -779,7 +916,7 @@ tui_edit_file() {
         fi
     done <<<"$out"
     if (( bad )); then
-        if dialog --title "校验" --yesno "发现 ${bad} 条非法行:\n${badlist}\n忽略非法行并保存?" 16 70 2>/dev/null; then
+        if tui_confirm "校验" "发现 ${bad} 条非法行:\n${badlist}\n忽略非法行并保存?"; then
             backup_configs >/dev/null || return 1
             local kept=""
             while IFS= read -r line || [[ -n "$line" ]]; do
@@ -788,7 +925,7 @@ tui_edit_file() {
                 if [[ "$which" == "ports" ]]; then
                     canon_key "$line" >/dev/null 2>&1 && kept+="${line}"$'\n'
                 else
-                    valid_ip_spec "${t%%[[:space:]]*}" && kept+="${line}"$'\n'
+                    valid_ip_spec "${t%%[![:space:]]*}" && kept+="${line}"$'\n'
                 fi
             done <<<"$out"
             printf '%s' "$kept" > "$file"
@@ -801,83 +938,89 @@ tui_edit_file() {
         printf '%s\n' "$out" > "$file"
         tui_msg "已保存" "$file"
     fi
+    return 0
+}
+
+tui_config_run() {
+    local v out
+    case "$1" in
+        1) v="$(tui_input "添加端口" "格式: 端口/协议[/族], 如 8080/tcp 或 8000:8100/tcp")" || return 0
+           out="$(config_add_port "$v" 2>&1)" || true; tui_msg "结果" "$out" ;;
+        2) v="$(tui_input "删除端口" "输入要移除的条目:")" || return 0
+           out="$(config_del_port "$v" 2>&1)" || true; tui_msg "结果" "$out" ;;
+        3) v="$(tui_input "添加 IP" "IP 或 CIDR:")" || return 0
+           out="$(config_add_ip "$v" 2>&1)" || true; tui_msg "结果" "$out" ;;
+        4) v="$(tui_input "删除 IP" "输入要移除的 IP:")" || return 0
+           out="$(config_del_ip "$v" 2>&1)" || true; tui_msg "结果" "$out" ;;
+        5) out="$(config_list ports 2>&1; echo; config_list ip 2>&1)"; tui_msg "当前白名单" "$out" ;;
+        6) tui_edit_file ports ;;
+        7) tui_edit_file ip ;;
+        q) return 1 ;;
+    esac
+    return 0
 }
 
 tui_config() {
-    local choice v out
-    while true; do
-        choice="$(tui_dlg --title "配置管理" --menu "v2 语法: 22/tcp, 8000:8100/tcp, 443/tcp/v6, icmp" 14 70 7 \
-            1 "添加端口白名单" 2 "删除端口白名单" 3 "添加 IP 白名单" 4 "删除 IP 白名单" \
-            5 "查看当前白名单" 6 "编辑端口白名单文件" 7 "编辑 IP 白名单文件" q "返回主菜单")" || return 0
-        case "$choice" in
-            1) v="$(tui_input "添加端口" "格式: 端口/协议[/族]")" || continue
-               out="$(config_add_port "$v" 2>&1)" || true; tui_msg "结果" "$out" ;;
-            2) v="$(tui_input "删除端口" "输入要移除的条目:")" || continue
-               out="$(config_del_port "$v" 2>&1)" || true; tui_msg "结果" "$out" ;;
-            3) v="$(tui_input "添加 IP" "IP 或 CIDR:")" || continue
-               out="$(config_add_ip "$v" 2>&1)" || true; tui_msg "结果" "$out" ;;
-            4) v="$(tui_input "删除 IP" "输入要移除的 IP:")" || continue
-               out="$(config_del_ip "$v" 2>&1)" || true; tui_msg "结果" "$out" ;;
-            5) out="$(config_list ports 2>&1; echo; config_list ip 2>&1)"; tui_msg "当前白名单" "$out" ;;
-            6) tui_edit_file ports ;;
-            7) tui_edit_file ip ;;
-            q|"") return 0 ;;
-        esac
-    done
+    _tui_menu_loop "配置管理 · v2语法: 22/tcp · 8000:8100/tcp · 443/tcp/v6 · icmp" _TUI_CFG_TAGS _TUI_CFG_NAMES tui_config_run
 }
 
-tui_ban() {
-    local choice ip out
-    choice="$(tui_dlg --title "封禁管理" --menu "手动封禁/解封" 10 60 3 \
-        1 "封禁 IP" 2 "解封 IP" 3 "查看当前封禁")" || return 0
-    case "$choice" in
+tui_ban_run() {
+    local ip out
+    case "$1" in
         1) ip="$(tui_input "封禁 IP" "输入要封禁的 IP:")" || return 0
            out="$(ban_ip "$ip" 2>&1)" || true; tui_msg "结果" "$out" ;;
         2) ip="$(tui_input "解封 IP" "输入要解封的 IP:")" || return 0
            out="$(unban_ip "$ip" 2>&1)" || true; tui_msg "结果" "$out" ;;
-        3) out="$(fail2ban_read status 2>/dev/null || echo 'fail2ban 未运行')\n手动封禁:\n$(ufw_read status | grep auto-firewall-manual || echo '  (无)')"
+        3) out="$(fail2ban_read status || echo 'fail2ban 未运行')
+手动封禁:
+$(ufw_read status | grep auto-firewall-manual || echo '  (无)')"
            tui_msg "封禁状态" "$out" ;;
+        q) return 1 ;;
     esac
+    return 0
+}
+
+tui_ban() {
+    _tui_menu_loop "封禁管理" _TUI_BAN_TAGS _TUI_BAN_NAMES tui_ban_run
 }
 
 tui_run() {
     local out err=0
     case "$1" in
         1) out="$(show_status 2>&1)"; tui_msg "总览仪表盘" "$out" ;;
-        2) out="$(port_check 2>&1)" || err=1; tui_msg "端口检测$([[ $err == 1 ]] && echo 部分失败)" "$out" ;;
+        2) out="$(port_check 2>&1)" || err=1
+           if (( err )); then tui_msg "端口检测(部分失败)" "$out"; else tui_msg "端口检测" "$out"; fi ;;
         3) out="$(fail2ban_check 2>&1)" || err=1; tui_msg "Fail2ban 检测" "$out" ;;
         4) out="$(cleanup 2>&1)"; tui_msg "系统清理" "$out" ;;
         5) tui_config ;;
-        6) if dialog --title "恢复默认" --yesno "确认恢复默认配置(all)? 将先备份" 10 60 2>/dev/null; then
+        6) if confirm "恢复默认配置(all)? 将先备份"; then
                out="$(ASSUME_YES=1 reset_config all 2>&1)" || true; tui_msg "恢复默认" "$out"
            fi ;;
         7) tui_ban ;;
-        8) dialog --title "实时日志" --tailbox "$LOG_FILE" 24 80 2>/dev/null ;;
+        8) out="$(tail -n 25 "$LOG_FILE" 2>/dev/null || echo '(无日志)')"
+           tui_msg "实时日志（最近25行）" "$out" ;;
         9) out="$(DRY_RUN=1 port_check 2>&1)" || true
-           out="$(grep '\[DRYRUN\]' "$LOG_FILE" | tail -30)"
-           tui_msg "Dry-run 将要执行的动作(最近30条)" "$out" ;;
-        10) out="$(show_version 2>&1)"; tui_msg "版本信息" "$out" ;;
-        0) uninstall ;;
-        q|"") return 0 ;;
+           out="$(grep '\[DRYRUN\]' "$LOG_FILE" | tail -25)"
+           if [[ -z "$out" ]]; then out='(无待执行动作)'; fi
+           tui_msg "Dry-run 将要执行的动作（最近25条）" "$out" ;;
+        a) out="$(show_version 2>&1)"; tui_msg "版本信息" "$out" ;;
+        x) uninstall ;;
+        q) return 1 ;;
     esac
+    return 0
 }
 
 tui_menu() {
-    if ! command -v dialog &>/dev/null || [[ ! -t 1 ]]; then
-        _info "无 dialog 或非交互终端, 降级为文本帮助"
+    # 非交互终端降级为文本帮助; AUTO_FW_TUI_TEST=1 为测试 seam（bats 管道驱动）
+    if [[ ! -t 1 && "${AUTO_FW_TUI_TEST:-0}" != "1" ]]; then
+        _info "非交互终端, 降级为文本帮助"
         show_help
         return 0
     fi
     ensure_locale_utf8
-    local choice
-    while true; do
-        choice="$(tui_dlg --title "管理菜单" --menu "请选择操作" 20 66 12 \
-            1 "总览仪表盘" 2 "端口检测" 3 "Fail2ban检测" 4 "系统清理" \
-            5 "配置管理(增删/编辑)" 6 "恢复默认配置" 7 "封禁/解封 IP" 8 "实时日志" \
-            9 "Dry-run 演练" 10 "版本信息" 0 "卸载脚本与配置" q "退出")" || break
-        tui_run "$choice" || _err "菜单动作返回错误"
-    done
-    clear 2>/dev/null || true
+    _tui_menu_loop "Auto-Firewall 管理台 v${SCRIPT_VERSION}" TUI_TAGS TUI_NAMES tui_run
+    printf '\033[0m\033[2J\033[H'
+    return 0
 }
 
 #---- Fail2ban + Nginx + UFW 集成 ---------------------------------------------
@@ -1235,16 +1378,18 @@ GWHDR
         echo ""
         echo "# --- 自动检测到的端口（基于首次运行时的监听状态）---"
     } > "$WHITELIST_FILE"
-    for k in $keys; do
-        base="${k%%/*}"; port="${base%%:*}"
-        proto="${k#*/}"; proto="${proto%%/*}"
-        svc="$(awk -v p=":${port} " 'index($0,p){ if (match($0,/\(\("[^"]+"/)){s=substr($0,RSTART+3);sub(/".*/,"",s);print s;exit} }' <<<"$raw")"
-        [[ -z "$svc" ]] && svc="auto-detected"
-        echo "${k}  # ${svc}" >> "$WHITELIST_FILE"
-    done
-    echo "" >> "$WHITELIST_FILE"
-    echo "# --- 用户自定义端口（可在此添加）---" >> "$WHITELIST_FILE"
-    echo "# 8080/tcp  # 示例: 自定义Web服务" >> "$WHITELIST_FILE"
+    {
+        for k in $keys; do
+            base="${k%%/*}"; port="${base%%:*}"
+            proto="${k#*/}"; proto="${proto%%/*}"
+            svc="$(awk -v p=":${port} " 'index($0,p){ if (match($0,/\(\("[^"]+"/)){s=substr($0,RSTART+3);sub(/".*/,"",s);print s;exit} }' <<<"$raw")"
+            [[ -z "$svc" ]] && svc="auto-detected"
+            echo "${k}  # ${svc}"
+        done
+        echo ""
+        echo "# --- 用户自定义端口（可在此添加）---"
+        echo "# 8080/tcp  # 示例: 自定义Web服务"
+    } >> "$WHITELIST_FILE"
     _info "白名单已生成: $WHITELIST_FILE"
 }
 
@@ -1273,7 +1418,9 @@ refresh_ufw_table() {
     while IFS= read -r line; do
         [[ "$line" != *ALLOW* ]] && continue
         line="${line#"${line%%[^ ]*}"}"                       # 去前导空白
-        line="$(sed 's/^\[[0-9]*\][[:space:]]*//' <<<"$line")" # 去 numbered 前缀
+        if [[ "$line" =~ ^\[[0-9]+\][[:space:]]*(.*)$ ]]; then
+            line="${BASH_REMATCH[1]}"                        # 去 numbered 前缀
+        fi
         marker="none"
         case "$line" in
             *auto-firewall-whitelist*) marker="auto-firewall-whitelist" ;;
@@ -1364,8 +1511,9 @@ port_check() {
 
     # 3. 规则表缓存 + 差分执行（尽力而为, 结束汇总退出, spec §2.5）
     refresh_ufw_table
-    local actions line op key err=0
-    actions="$(compute_port_actions "$(echo "$cur" | tr '\n' ' ')" "$prev" "$(echo "$wl" | tr '\n' ' ')")"
+    local actions line op key err=0 sshp
+    sshp="$(detect_ssh_ports)"
+    actions="$(compute_port_actions "$(echo "$cur" | tr '\n' ' ')" "$prev" "$(echo "$wl" | tr '\n' ' ')" "$sshp")"
     local -a args
     while IFS= read -r line; do
         [[ -z "$line" ]] && continue
@@ -1413,8 +1561,6 @@ cleanup() {
     acquire_lock
     _info "开始系统清理..."
 
-    local freed=0
-
     # 1. APT 包管理缓存清理
     if command -v apt-get &>/dev/null; then
         apt_exec clean &>/dev/null || true
@@ -1438,7 +1584,6 @@ cleanup() {
     if [[ $mem_free_pct -lt $MEM_FREE_THRESHOLD ]]; then
         sync
         echo 3 > /proc/sys/vm/drop_caches 2>/dev/null || true
-        freed=1
         _info "内存缓存已释放（空闲内存 ${mem_free_pct}% < ${MEM_FREE_THRESHOLD}%）。"
     else
         _info "空闲内存充足（${mem_free_pct}%），跳过缓存释放。"
@@ -1540,8 +1685,8 @@ show_help() {
      或安装后直接敲快捷命令: x [命令]（替代 sudo bash auto-firewall.sh）
 
 命令:
-  install                安装(目录/迁移/dialog/快捷命令/cron/首次初始化)
-  menu                   打开 dialog 图形管理界面(需 TTY; 非交互降级为帮助)
+  install                安装(目录/迁移/快捷命令/cron/首次初始化)
+  menu                   打开原生 ANSI 图形管理界面(需 TTY; 非交互降级为帮助)
   port-check             扫描端口并自动放行/回收
   fail2ban-check         检测 Fail2ban, 幂等同步 jail 配置
   cleanup                系统清理 + 日志/备份轮转
@@ -1564,6 +1709,7 @@ show_help() {
 端口白名单 v2 语法(保留 v1 兼容):
   22/tcp            双栈 SSH    | 8000:8100/tcp  端口区间
   443/tcp/v6        仅 IPv6     | icmp 或 -/esp  无端口协议
+SSH 保护: 自动探测 sshd 监听端口(sshd_config Port + 实际监听), 非写死 22
 
 文件: /opt/auto-firewall/{auto-firewall.sh,port-whitelist.conf,ip-whitelist.conf,ports.state,.schema_version,backup/,logs/}
 Cron: */5 port-check | */15 fail2ban-check | 0 * cleanup
@@ -1664,14 +1810,7 @@ do_install() {
     # 安装 Cron
     install_cron
 
-    # TUI 依赖 dialog（失败不致命, 降级为文本帮助）
-    if ! command -v dialog &>/dev/null; then
-        _info "安装 dialog（TUI 依赖）..."
-        apt_exec update -qq && apt_exec install -y -qq dialog \
-            || _err "dialog 安装失败, menu 将降级为文本帮助"
-    fi
-
-    # 命令行快捷命令 x/X（spec §6.2）
+    # 命令行快捷命令 x/X（spec §6.2; TUI 为原生实现, 无外部依赖）
     install_shortcut
 
     _info "安装完成！"
@@ -1744,14 +1883,7 @@ main() {
         fail2ban-check) fail2ban_check || rc=$? ;;
         cleanup)        cleanup || rc=$? ;;
         status)         show_status || rc=$? ;;
-        menu)
-            if command -v dialog &>/dev/null && [[ -t 1 ]]; then
-                ensure_locale_utf8
-                tui_menu || rc=$?
-            else
-                _info "dialog 不可用或非交互终端, 降级为文本帮助"
-                show_help
-            fi ;;
+        menu)           tui_menu ;;
         config)         config_main "${CMD_ARGS[@]:1}" || rc=$? ;;
         reset-config)   reset_config "${CMD_ARGS[1]:-all}" || rc=$? ;;
         ban)            ban_ip "${CMD_ARGS[1]:-}" "${CMD_ARGS[2]:-}" || rc=$? ;;
