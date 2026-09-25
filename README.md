@@ -37,6 +37,61 @@ x reset-config    # 恢复默认配置（备份+确认后）
 x version         # 版本信息
 ```
 
+## 部署方法
+
+### 环境要求
+
+- Debian 12+ / Ubuntu 22.04+（需存在 `/etc/debian_version`），推荐 Debian 12/13、Ubuntu 24.04；
+- root 权限（`sudo`）；bash 4.4+（系统自带即可）；
+- 无需任何额外依赖——TUI 为原生 ANSI 实现，不依赖 dialog/ncurses。
+
+### 1. 下载
+
+```bash
+# 方式 A：git 克隆（推荐，后续升级只需 git pull）
+git clone https://github.com/yishanbujianshui/-auto-firewall.sh-.git /opt/src/auto-firewall
+cd /opt/src/auto-firewall
+
+# 方式 B：直接下载单文件（无 git 环境时）
+wget -O /tmp/auto-firewall.sh \
+  https://raw.githubusercontent.com/yishanbujianshui/-auto-firewall.sh-/main/auto-firewall.sh
+```
+
+> 仓库若为私有：用 SSH 克隆 `git clone git@github.com:yishanbujianshui/-auto-firewall.sh-.git`（需先在 GitHub 配好本机 SSH key），或改用带 token 的 HTTPS。
+
+### 2. 安装
+
+```bash
+sudo bash auto-firewall.sh install        # 方式 A（在克隆目录内）
+sudo bash /tmp/auto-firewall.sh install   # 方式 B
+```
+
+install 幂等，依次完成：环境检测 → 旧配置无损迁移（先备份）→ 安装/初始化 UFW（启用前自动开 IPv6）→ 扫描监听端口生成白名单 → 安装配置 Fail2ban（sshd+nginx 联动 UFW）→ 修补 Docker 绕过 UFW 漏洞 → 部署 Cron 与 `x`/`X` 快捷命令。脚本本体自复制到 `/opt/auto-firewall/auto-firewall.sh`，下载目录随后可删除。
+
+### 3. 安装后验证
+
+```bash
+source /etc/profile.d/auto-firewall.sh    # 或重新登录，使 x 生效
+x status                                  # 防火墙/白名单/Fail2ban 总览
+x version                                 # 确认版本与 schema
+sudo ufw status                           # 应有带 auto-firewall 注释的放行规则
+```
+
+建议立即：`x config add ip 你的公网IP`（防 Fail2ban 误封），首次可 `x port-check --dry-run` 演练。
+
+### 4. 升级
+
+```bash
+cd /opt/src/auto-firewall && git pull && sudo bash auto-firewall.sh install
+# 或重新 wget 单文件后再 sudo bash /tmp/auto-firewall.sh install
+```
+
+重复执行 `install` 即升级：已初始化的防火墙不会重置（`.first_run_done` 标记），配置格式变更时自动备份并逐级迁移，迁移失败自动从备份还原；cron/快捷命令按区块幂等覆盖。升级后 `x version` 确认。
+
+### 5. 卸载与回退
+
+见下文「卸载」章节；任意阶段的配置快照在 `/opt/auto-firewall/backup/`（保留最近 10 份），`--purge` 卸载前还会另存一份到 `/root/auto-firewall-uninstall-backup-*`。
+
 ## 子命令一览
 
 `install / menu / port-check / fail2ban-check / cleanup / status / config / reset-config / ban / unban / version / log / uninstall / help`
