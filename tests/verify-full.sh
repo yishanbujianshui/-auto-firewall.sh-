@@ -1,15 +1,15 @@
 #!/bin/bash
 # 临时全量真机验证（root 运行; 验证后删除）
 set -u
-cd "$(dirname "$0")/.."
+cd "$(dirname "$0")/.." || exit 1
 S="$PWD/auto-firewall.sh"
 PASS=0; FAIL=0
 ck() { # ck 描述 命令
     if eval "$2" >/dev/null 2>&1; then echo "PASS: $1"; PASS=$((PASS+1));
     else echo "FAIL: $1"; FAIL=$((FAIL+1)); fi
 }
-tui() { # tui 按键序列 -> 输出落盘 /root/O_last（避免 eval 二次展开 $O）
-    printf "$1" | env AUTO_FW_TUI_TEST=1 bash "$S" menu > /root/O_last 2>&1
+tui() { # tui 按键序列 -> 输出落盘 /root/O_last（避免 eval 二次展开 $O）; %b 保留按键序列中的转义
+    printf '%b' "$1" | env AUTO_FW_TUI_TEST=1 bash "$S" menu > /root/O_last 2>&1
 }
 
 echo "########## A. 环境重置 + install ##########"
@@ -39,9 +39,11 @@ ck "config list ports" "bash $S config list ports | grep -q '9000:9100'"
 ck "config list ip" "bash $S config list ip | grep -q '203.0.113.55'"
 ck "config del port SSH拒绝" "! bash $S config del port 5522/tcp >/dev/null 2>&1"
 ck "config del port 正常" "bash $S config del port 9000:9100/tcp 2>/dev/null | grep -q '移除'"
+# shellcheck disable=SC2016  # 故意单引号: 由 eval 展开的编辑器脚本模板
 printf '#!/bin/bash\necho "31338/tcp  # ed-test" >> "$1"\n' > /root/edv; chmod +x /root/edv
 ck "config edit 保存成功" "env EDITOR=/root/edv script -qec \"bash $S config edit ports\" /dev/null >/dev/null 2>&1 && grep -q '^31338/tcp' /opt/auto-firewall/port-whitelist.conf"
-printf '#!/bin/bash\necho \"bad !!!\" >> "$1"\n' > /root/edv2; chmod +x /root/edv2
+# shellcheck disable=SC2016  # 故意单引号: 由 eval 展开的编辑器脚本模板
+printf '#!/bin/bash\necho "bad !!!" >> "$1"\n' > /root/edv2; chmod +x /root/edv2
 ck "config edit 非法行拒绝" "env EDITOR=/root/edv2 script -qec \"bash $S config edit ports\" /dev/null >/dev/null 2>&1; ! grep -q 'bad !!!' /opt/auto-firewall/port-whitelist.conf"
 bash "$S" config del port 31338/tcp >/dev/null 2>&1; rm -f /root/edv /root/edv2
 ck "ban 真实生效" "bash $S ban 198.51.100.66 >/dev/null 2>&1 && ufw status | grep -q '198.51.100.66'"
