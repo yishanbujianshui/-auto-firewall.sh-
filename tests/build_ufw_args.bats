@@ -1,4 +1,5 @@
 #!/usr/bin/env bats
+# shellcheck disable=SC1091,SC2016,SC2034,SC2153,SC2317
 # T3: build_ufw_args 描述符 -> ufw 参数 token（spec §2.3, GAP-4）
 # 编码约定: 双栈 tcp/udp 简写 "<port>/<proto>"; 显式族/portless 用
 #   "proto <p> from any to <dst>[ port <n>]"; any 无 proto

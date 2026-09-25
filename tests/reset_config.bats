@@ -1,4 +1,5 @@
 #!/usr/bin/env bats
+# shellcheck disable=SC1091,SC2016,SC2034,SC2153,SC2317
 # T11: reset-config / ban / unban / version / log / confirm（spec §7.2/§7.3/§9）
 bats_require_minimum_version 1.5.0
 
@@ -25,7 +26,7 @@ teardown() { rm -rf "$AUTO_FW_HOME" "$STUB"; }
     echo "custom-junk" > "$IP_WHITELIST_FILE"
     init_ip_whitelist --force
     grep -q '^127.0.0.1/8' "$IP_WHITELIST_FILE"
-    ! grep -q 'custom-junk' "$IP_WHITELIST_FILE"
+    if grep -q 'custom-junk' "$IP_WHITELIST_FILE"; then return 1; fi
 }
 
 @test "init_ip_whitelist 默认不覆盖" {
@@ -40,7 +41,7 @@ teardown() { rm -rf "$AUTO_FW_HOME" "$STUB"; }
     reset_config ports
     grep -q '^22/tcp' "$WHITELIST_FILE"
     grep -q '^8081/tcp' "$WHITELIST_FILE"
-    ! grep -q '^9999/tcp' "$WHITELIST_FILE"
+    if grep -q '^9999/tcp' "$WHITELIST_FILE"; then return 1; fi
 }
 
 @test "reset-config 不改变 schema 版本" {

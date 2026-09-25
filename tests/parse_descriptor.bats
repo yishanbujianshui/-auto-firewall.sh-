@@ -1,4 +1,5 @@
 #!/usr/bin/env bats
+# shellcheck disable=SC1091,SC2016,SC2034,SC2153,SC2317
 # T2: 统一端口描述符 parse_descriptor / canon_key（spec §2.1-§2.2）
 
 load test_helper/common

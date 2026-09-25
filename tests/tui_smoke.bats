@@ -1,4 +1,5 @@
 #!/usr/bin/env bats
+# shellcheck disable=SC1091,SC2016,SC2034,SC2153,SC2317
 # T13: profile.d 快捷方式 + 原生 ANSI TUI（无 dialog 依赖）
 bats_require_minimum_version 1.5.0
 
@@ -85,9 +86,16 @@ teardown() { rm -rf "$AUTO_FW_HOME"; }
     run bash -c "source '${BATS_TEST_DIRNAME}/../auto-firewall.sh'; tui_confirm t b </dev/null"; [ "$status" -ne 0 ]
 }
 
-@test "tui_input 读取输入行" {
-    run bash -c "source '${BATS_TEST_DIRNAME}/../auto-firewall.sh'; printf '80/tcp\n' | tui_input t p"
-    [[ "$output" == *"80/tcp"* ]]
+@test "tui_input 读入并写入输入文件" {
+    printf '80/tcp\n' | tui_input t p
+    [ "$(cat "$TUI_INPUT_FILE")" = "80/tcp" ]
+    rm -f "$TUI_INPUT_FILE"
+}
+
+@test "tui_input 空输入返回非0 且不写文件" {
+    run bash -c "source '${BATS_TEST_DIRNAME}/../auto-firewall.sh'; printf '\n' | tui_input t p"
+    [ "$status" -ne 0 ]
+    [ ! -e "$TUI_INPUT_FILE" ]
 }
 
 @test "tui_msg 渲染标题与正文且 Enter 返回" {

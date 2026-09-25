@@ -1,4 +1,5 @@
 #!/usr/bin/env bats
+# shellcheck disable=SC1091,SC2016,SC2034,SC2153,SC2317
 # T4: 全局 flag 解析 parse_args（spec §9 G6）
 
 load test_helper/common

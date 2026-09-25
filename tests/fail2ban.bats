@@ -1,4 +1,5 @@
 #!/usr/bin/env bats
+# shellcheck disable=SC1091,SC2016,SC2034,SC2153,SC2317
 # T9: Fail2ban 补强（spec §5: jail 日志正确性 / MTA 降级 / 路径 seam）
 bats_require_minimum_version 1.5.0
 
@@ -39,12 +40,12 @@ setup() {
     rebuild_f2b_jail
     if has_mta; then skip "此机器装有 MTA"; fi
     grep -q 'action = %(action_)s' "$AUTO_FW_F2B_JAIL_CONF"
-    ! grep -q '%(action_mwl)s' "$AUTO_FW_F2B_JAIL_CONF"
+    if grep -q '%(action_mwl)s' "$AUTO_FW_F2B_JAIL_CONF"; then return 1; fi
 }
 
 @test "rebuild_f2b_jail: 无 nginx 日志时不生成 nginx jail" {
     rebuild_f2b_jail
-    ! grep -q '^\[nginx-ufw\]' "$AUTO_FW_F2B_JAIL_CONF"
+    if grep -q '^\[nginx-ufw\]' "$AUTO_FW_F2B_JAIL_CONF"; then return 1; fi
 }
 
 @test "rebuild_f2b_jail: botsearch 用 error.log, 404/ufw 用 access.log" {

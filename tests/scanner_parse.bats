@@ -1,4 +1,5 @@
 #!/usr/bin/env bats
+# shellcheck disable=SC1091,SC2016,SC2034,SC2153,SC2317
 # T5: parse_scan_line IPv6/zone-id/family 解析（spec §3.1, GAP-2）
 
 load test_helper/common

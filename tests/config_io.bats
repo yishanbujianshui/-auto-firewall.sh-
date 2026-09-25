@@ -1,4 +1,5 @@
 #!/usr/bin/env bats
+# shellcheck disable=SC1091,SC2016,SC2034,SC2153,SC2317
 # T10: config add/del/list（spec §7.1）
 bats_require_minimum_version 1.5.0
 
@@ -30,7 +31,7 @@ setup() {
 @test "add port: 非法值拒绝且不改文件" {
     run config_add_port "99999/tcp"
     [ "$status" -ne 0 ]
-    ! grep -q '99999' "$WHITELIST_FILE"
+    if grep -q '99999' "$WHITELIST_FILE"; then return 1; fi
 }
 
 @test "add port: 去重幂等" {
@@ -47,7 +48,7 @@ setup() {
 @test "del port: 存在项删除" {
     config_add_port "80/tcp"
     config_del_port "80/tcp"
-    ! grep -q '^80/tcp' "$WHITELIST_FILE"
+    if grep -q '^80/tcp' "$WHITELIST_FILE"; then return 1; fi
 }
 
 @test "del port: SSH 22 拒绝删除" {
@@ -78,7 +79,7 @@ setup() {
 @test "del ip: 用户项可删" {
     config_add_ip "198.51.100.7"
     config_del_ip "198.51.100.7"
-    ! grep -q '^198.51.100.7' "$IP_WHITELIST_FILE"
+    if grep -q '^198.51.100.7' "$IP_WHITELIST_FILE"; then return 1; fi
 }
 
 @test "变更写入前生成备份（backup_configs 被调用）" {

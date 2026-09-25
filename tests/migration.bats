@@ -1,4 +1,5 @@
 #!/usr/bin/env bats
+# shellcheck disable=SC1091,SC2016,SC2034,SC2153,SC2317
 # T7: 版本化无损迁移（spec §4, GAP-1）
 
 load test_helper/common
@@ -60,8 +61,8 @@ setup() {
     before="$(cat "$WHITELIST_FILE")"
     migrate_v1_to_v2
     local dst
-    dst="$(ls -d "$BACKUP_DIR"/*/ | head -1)"
-    grep -qF 'this is a bogus line' "${dst}port-whitelist.conf"
+    dst="$(find "$BACKUP_DIR" -mindepth 1 -maxdepth 1 -type d | sort | head -1)"
+    grep -qF 'this is a bogus line' "${dst}/port-whitelist.conf"
 }
 
 @test "run_migrations: 无标记+有配置 视为 v1 并迁移" {

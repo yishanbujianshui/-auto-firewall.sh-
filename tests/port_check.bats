@@ -1,4 +1,5 @@
 #!/usr/bin/env bats
+# shellcheck disable=SC1091,SC2016,SC2034,SC2153,SC2317
 # T8: port_check / read_whitelist / apply_whitelist 集成（桩 ss/ufw）
 bats_require_minimum_version 1.5.0
 

@@ -1,8 +1,10 @@
 #!/usr/bin/env bats
+# shellcheck disable=SC1091,SC2016,SC2034,SC2153,SC2317
 # T1: 可测试性地基 —— 路径 env 覆盖 / source 守卫 / 命令薄封装
 
 setup() {
-  export AUTO_FW_HOME="$(mktemp -d)"
+  export AUTO_FW_HOME
+  AUTO_FW_HOME="$(mktemp -d)"
 }
 
 teardown() { rm -rf "$AUTO_FW_HOME"; }

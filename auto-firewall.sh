@@ -792,6 +792,8 @@ ufw_read() { ufw "$@" 2>/dev/null; }    # 只读查询, 不经 run_cmd
 # 主菜单定义（tag 与 tui_run 分支一致; 1-9 数字, a=版本, x=卸载, q=退出）
 # 注: 数组以名称经 nameref 动态引用, shellcheck 无法静态追踪
 # shellcheck disable=SC2034
+TUI_INPUT_FILE="${TUI_INPUT_FILE:-${AUTO_FW_HOME:-/opt/auto-firewall}/.tui_input}"
+# shellcheck disable=SC2034
 TUI_TAGS=(1 2 3 4 5 6 7 8 9 a x q)
 # shellcheck disable=SC2034
 TUI_NAMES=("总览仪表盘" "端口检测" "Fail2ban检测" "系统清理" "配置管理(增删/编辑)" "恢复默认配置" "封禁/解封 IP" "实时日志" "Dry-run 演练" "版本信息" "卸载脚本与配置" "退出")
@@ -882,12 +884,13 @@ tui_msg() { # $1=标题 $2=正文; Enter/任意键返回, EOF 安全
     return 0
 }
 
-tui_input() { # $1=标题 $2=提示; stdout=输入行; 空/EOF 返回1
+tui_input() { # $1=标题 $2=提示; 输入写入文件 $TUI_INPUT_FILE（管道末端在子shell执行, 变量不可传, 故用文件传递）; 返回0=有值
     printf '\033[2J\033[H\033[1m── %s ──\033[0m\n%s\n> ' "$1" "$2"
     local v=""
     IFS= read -r v 2>/dev/null || return 1
     [[ -n "$v" ]] || return 1
-    printf '%s' "$v"
+    printf '%s' "$v" > "$TUI_INPUT_FILE"
+    return 0
 }
 
 tui_confirm() { # $1=标题 $2=正文; y 返回0, 其它/EOF 返回1
@@ -949,16 +952,20 @@ tui_edit_file() {
 }
 
 tui_config_run() {
-    local v out
+    local out
     case "$1" in
-        1) v="$(tui_input "添加端口" "格式: 端口/协议[/族], 如 8080/tcp 或 8000:8100/tcp")" || return 0
-           out="$(config_add_port "$v" 2>&1)" || true; tui_msg "结果" "$out" ;;
-        2) v="$(tui_input "删除端口" "输入要移除的条目:")" || return 0
-           out="$(config_del_port "$v" 2>&1)" || true; tui_msg "结果" "$out" ;;
-        3) v="$(tui_input "添加 IP" "IP 或 CIDR:")" || return 0
-           out="$(config_add_ip "$v" 2>&1)" || true; tui_msg "结果" "$out" ;;
-        4) v="$(tui_input "删除 IP" "输入要移除的 IP:")" || return 0
-           out="$(config_del_ip "$v" 2>&1)" || true; tui_msg "结果" "$out" ;;
+        1) if tui_input "添加端口" "格式: 端口/协议[/族], 如 8080/tcp 或 8000:8100/tcp"; then
+               out="$(config_add_port "$(cat "$TUI_INPUT_FILE")" 2>&1)" || true; tui_msg "结果" "$out"; rm -f "$TUI_INPUT_FILE"
+           fi ;;
+        2) if tui_input "删除端口" "输入要移除的条目:"; then
+               out="$(config_del_port "$(cat "$TUI_INPUT_FILE")" 2>&1)" || true; tui_msg "结果" "$out"; rm -f "$TUI_INPUT_FILE"
+           fi ;;
+        3) if tui_input "添加 IP" "IP 或 CIDR:"; then
+               out="$(config_add_ip "$(cat "$TUI_INPUT_FILE")" 2>&1)" || true; tui_msg "结果" "$out"; rm -f "$TUI_INPUT_FILE"
+           fi ;;
+        4) if tui_input "删除 IP" "输入要移除的 IP:"; then
+               out="$(config_del_ip "$(cat "$TUI_INPUT_FILE")" 2>&1)" || true; tui_msg "结果" "$out"; rm -f "$TUI_INPUT_FILE"
+           fi ;;
         5) out="$(config_list ports 2>&1; echo; config_list ip 2>&1)"; tui_msg "当前白名单" "$out" ;;
         6) tui_edit_file ports ;;
         7) tui_edit_file ip ;;
@@ -972,12 +979,14 @@ tui_config() {
 }
 
 tui_ban_run() {
-    local ip out
+    local out
     case "$1" in
-        1) ip="$(tui_input "封禁 IP" "输入要封禁的 IP:")" || return 0
-           out="$(ban_ip "$ip" 2>&1)" || true; tui_msg "结果" "$out" ;;
-        2) ip="$(tui_input "解封 IP" "输入要解封的 IP:")" || return 0
-           out="$(unban_ip "$ip" 2>&1)" || true; tui_msg "结果" "$out" ;;
+        1) if tui_input "封禁 IP" "输入要封禁的 IP:"; then
+               out="$(ban_ip "$(cat "$TUI_INPUT_FILE")" 2>&1)" || true; tui_msg "结果" "$out"; rm -f "$TUI_INPUT_FILE"
+           fi ;;
+        2) if tui_input "解封 IP" "输入要解封的 IP:"; then
+               out="$(unban_ip "$(cat "$TUI_INPUT_FILE")" 2>&1)" || true; tui_msg "结果" "$out"; rm -f "$TUI_INPUT_FILE"
+           fi ;;
         3) out="$(fail2ban_read status || echo 'fail2ban 未运行')
 手动封禁:
 $(ufw_read status | grep auto-firewall-manual || echo '  (无)')"

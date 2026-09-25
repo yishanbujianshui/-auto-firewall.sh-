@@ -1,4 +1,5 @@
 #!/usr/bin/env bats
+# shellcheck disable=SC1091,SC2016,SC2034,SC2153,SC2317
 # SSH 端口自适应探测（不写死 22）
 bats_require_minimum_version 1.5.0
 

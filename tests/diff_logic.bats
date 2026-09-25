@@ -1,4 +1,5 @@
 #!/usr/bin/env bats
+# shellcheck disable=SC1091,SC2016,SC2034,SC2153,SC2317
 # T6: compute_port_actions 放行/回收差分（spec §3.3）
 bats_require_minimum_version 1.5.0
 
