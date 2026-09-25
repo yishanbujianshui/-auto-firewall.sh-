@@ -241,9 +241,9 @@ detect_ssh_ports() {
         parsed="$(parse_scan_line "$line")" || continue
         ports="${ports} ${parsed%%|*}"
     done <<<"$raw"
-    ports="$(printf '%s\n' $ports | grep -E '^[0-9]+$' | sort -un | tr '\n' ' ')"
+    ports="$(printf '%s' "$ports" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -un | tr '\n' ' ')"
     [[ -z "${ports// /}" ]] && ports="22"
-    echo "$ports" | sed 's/[[:space:]]*$//'
+    printf '%s\n' "${ports% }"
 }
 
 # 差分计算（spec §3.3）: 入参为空格分隔的 canon key 集合; 第4参为 SSH 保护端口列表(默认 "22")
@@ -790,13 +790,20 @@ uninstall() {
 ufw_read() { ufw "$@" 2>/dev/null; }    # 只读查询, 不经 run_cmd
 
 # 主菜单定义（tag 与 tui_run 分支一致; 1-9 数字, a=版本, x=卸载, q=退出）
+# 注: 数组以名称经 nameref 动态引用, shellcheck 无法静态追踪
+# shellcheck disable=SC2034
 TUI_TAGS=(1 2 3 4 5 6 7 8 9 a x q)
+# shellcheck disable=SC2034
 TUI_NAMES=("总览仪表盘" "端口检测" "Fail2ban检测" "系统清理" "配置管理(增删/编辑)" "恢复默认配置" "封禁/解封 IP" "实时日志" "Dry-run 演练" "版本信息" "卸载脚本与配置" "退出")
 
+# shellcheck disable=SC2034
 _TUI_CFG_TAGS=(1 2 3 4 5 6 7 q)
+# shellcheck disable=SC2034
 _TUI_CFG_NAMES=("添加端口白名单" "删除端口白名单" "添加 IP 白名单" "删除 IP 白名单" "查看当前白名单" "编辑端口白名单文件" "编辑 IP 白名单文件" "返回主菜单")
 
+# shellcheck disable=SC2034
 _TUI_BAN_TAGS=(1 2 3 q)
+# shellcheck disable=SC2034
 _TUI_BAN_NAMES=("封禁 IP" "解封 IP" "查看当前封禁" "返回主菜单")
 
 # 读一个按键 → 语义名: UP/DOWN/ENTER/ESC/EOF 或字符本身; 无输入(EOF/超时)输出 EOF 并返回1
