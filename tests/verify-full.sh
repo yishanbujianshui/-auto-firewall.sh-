@@ -4,6 +4,7 @@ set -u
 cd "$(dirname "$0")/.." || exit 1
 S="$PWD/auto-firewall.sh"
 VER="$(awk -F'"' '/^readonly SCRIPT_VERSION=/{print $2}' "$S")"   # 版本断言随脚本演进, 不再硬编码
+SSHP="$(bash -c "source '$S'; detect_ssh_ports" | awk '{print $1}')"   # SSH 端口按本机自适应, 不写死
 PASS=0; FAIL=0
 ck() { # ck 描述 命令
     if eval "$2" >/dev/null 2>&1; then echo "PASS: $1"; PASS=$((PASS+1));
@@ -33,7 +34,7 @@ ck "schema=2" "[ \"\$(cat /opt/auto-firewall/.schema_version)\" = 2 ]"
 ck "cron 区块存在" "grep -q 'BEGIN auto-firewall' /etc/crontab"
 ck "profile.d 快捷命令" "grep -q 'x() { afw_shortcut' /etc/profile.d/auto-firewall.sh"
 ck "白名单已生成(v2头)" "head -1 /opt/auto-firewall/port-whitelist.conf | grep -q 'schema-version: 2'"
-ck "SSH探测=5522(本机真实)" "bash -c 'source $S; [ \"\$(detect_ssh_ports)\" = 5522 ]'"
+ck "SSH探测=${SSHP}(本机真实)" "bash -c 'source $S; [ \"\$(detect_ssh_ports)\" = \"$SSHP\" ]'"
 
 echo "########## B. 全部 CLI 命令 ##########"
 ck "status" "bash $S status | grep -q '运行状态'"
@@ -48,7 +49,7 @@ ck "config add ip" "bash $S config add ip 203.0.113.55 2>/dev/null | grep -q '�
 ck "config del ip 保护拒绝" "! bash $S config del ip 127.0.0.1/8 >/dev/null 2>&1"
 ck "config list ports" "bash $S config list ports | grep -q '9000:9100'"
 ck "config list ip" "bash $S config list ip | grep -q '203.0.113.55'"
-ck "config del port SSH拒绝" "! bash $S config del port 5522/tcp >/dev/null 2>&1"
+ck "config del port SSH拒绝" "! bash $S config del port ${SSHP}/tcp >/dev/null 2>&1"
 ck "config del port 正常" "bash $S config del port 9000:9100/tcp 2>/dev/null | grep -q '移除'"
 # shellcheck disable=SC2016  # 故意单引号: 由 eval 展开的编辑器脚本模板
 printf '#!/bin/bash\necho "31338/tcp  # ed-test" >> "$1"\n' > /root/edv; chmod +x /root/edv
@@ -62,7 +63,7 @@ ck "unban 生效" "bash $S unban 198.51.100.66 >/dev/null 2>&1 && ! ufw status |
 ck "fail2ban-check" "bash $S fail2ban-check >/dev/null"
 ck "cleanup" "bash $S cleanup >/dev/null"
 ck "reset-config ip" "bash $S reset-config ip --yes >/dev/null 2>&1 && grep -q '^127.0.0.1/8' /opt/auto-firewall/ip-whitelist.conf"
-ck "reset-config ports 含5522" "bash $S reset-config ports --yes >/dev/null 2>&1 && grep -q '^5522/tcp' /opt/auto-firewall/port-whitelist.conf"
+ck "reset-config ports 含${SSHP}" "bash $S reset-config ports --yes >/dev/null 2>&1 && grep -q '^${SSHP}/tcp' /opt/auto-firewall/port-whitelist.conf"
 ck "dry-run 有标记日志" "bash $S config add port 6010/udp >/dev/null 2>&1 && bash $S port-check --dry-run >/dev/null 2>&1 && grep -q 'DRYRUN.*6010' /opt/auto-firewall/logs/auto-firewall.log && bash $S config del port 6010/udp >/dev/null 2>&1"
 ck "未知命令 rc=1" "! bash $S nosuchcmd >/dev/null 2>&1"
 ck "x/X 登录shell生效" "bash -lc 'type x >/dev/null && type X >/dev/null'"

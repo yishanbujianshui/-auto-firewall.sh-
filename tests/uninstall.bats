@@ -67,21 +67,21 @@ teardown() { rm -rf "$AUTO_FW_HOME" "$STUB" "$FAKE_ROOT" "$UFW_LOG"; }
 
 @test "--purge: 删除带标记规则但保留无标记规则" {
     ASSUME_YES=1 PURGE=1 uninstall
-    grep -q "delete 9000/tcp" "$UFW_LOG"
-    grep -q "delete 80/tcp" "$UFW_LOG"
+    grep -q "delete allow 9000/tcp" "$UFW_LOG"
+    grep -q "delete allow 80/tcp" "$UFW_LOG"
     run grep "8080" "$UFW_LOG"
     [ -z "$output" ]
 }
 
 @test "--purge: SSH 22 规则默认保留（防锁死）" {
     ASSUME_YES=1 PURGE=1 uninstall
-    run grep "delete 22/tcp" "$UFW_LOG"
+    run grep "delete allow 22/tcp" "$UFW_LOG"
     [ -z "$output" ]
 }
 
 @test "--purge --force-ssh: 才删 22" {
     ASSUME_YES=1 PURGE=1 FORCE_SSH=1 uninstall
-    grep -q "delete 22/tcp" "$UFW_LOG"
+    grep -q "delete allow 22/tcp" "$UFW_LOG"
 }
 
 @test "--purge: 移除 fail2ban 生成文件" {

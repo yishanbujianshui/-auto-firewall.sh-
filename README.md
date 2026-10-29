@@ -110,6 +110,8 @@ icmp                # 无端口协议（等价 -/icmp）
 ```
 
 > 注：区间 / icmp / 协议号等**无法被 ss/netstat 自动发现**，只能作为白名单（始终放行、永不自动回收）；自动扫描管理的是 tcp/udp 单端口动态规则。
+>
+> ufw 0.36（Ubuntu/Debian 当前版本）仅支持 `tcp/udp/esp/ah/igmp/gre/vrrp` 协议，**不支持 `icmp`、`sctp`、数字协议号**。脚本会先做能力探测，不支持的条目会明确提示并跳过（ICMP 已由 ufw 的 `before.rules` 默认放行，通常无需再配置）。
 
 ## 配置文件
 
@@ -151,12 +153,20 @@ x uninstall --purge      # 彻底档：另删脚本加的 ufw 规则(22 默认�
 
 ## 测试
 
+三套方案（都需要 Linux；Windows 下在 WSL Ubuntu 中执行）：
+
 ```bash
-# 单测（纯函数 + 桩集成，无需 root；bats-core + shellcheck）
+sudo apt-get install -y bats shellcheck ufw fail2ban iproute2 cron python3
+
+# 方案1: 静态检查 + 纯函数/桩集成单测（无需 root）
 bash tests/run.sh
 
-# 端到端：需在 Linux（如 WSL Debian）执行
-sudo apt-get install -y bats shellcheck ufw fail2ban iproute2
+# 方案2: root 真机端到端（install → 全 CLI → TUI 全按键 → 卸载）
+sudo bash tests/verify-full.sh
+
+# 方案3: root 真机运行时场景（真实监听端口动态放行/回收、白名单幂等、
+#        fail2ban 联动与真实封禁、并发锁、日志轮转、dry-run、幂等重装、purge）
+sudo bash tests/verify-runtime.sh
 ```
 
 Windows 下仅编辑代码；`ufw/ss` 相关测试必须在 Linux 跑。

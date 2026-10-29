@@ -40,6 +40,13 @@ teardown() { rm -rf "$AUTO_FW_HOME" "$STUB"; }
     [ "$output" = "22" ]
 }
 
+@test "detect_ssh_ports: set -e/pipefail 下无匹配也返回 22（不终止脚本）" {
+    rm -f "$AUTO_FW_SSHD_CONFIG"
+    run bash -c "set -euo pipefail; source '${BATS_TEST_DIRNAME}/../auto-firewall.sh'; detect_ssh_ports"
+    [ "$status" -eq 0 ]
+    [ "$output" = "22" ]
+}
+
 @test "compute_port_actions: 自定义 SSH 端口不被回收" {
     run compute_port_actions "" "2222/tcp" "" "2222"
     [ -z "$output" ]

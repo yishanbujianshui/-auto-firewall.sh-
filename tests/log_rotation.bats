@@ -17,6 +17,13 @@ load test_helper/common
     [ "$(wc -l < "$CRON_LOG_FILE")" -le "$LOG_RETAIN_LINES" ]
 }
 
+@test "rotate_log 对单行超长日志按字节兜底截断" {
+    python3 -c "open('$LOG_FILE','w').write('x'*1200000)"
+    [ "$(stat -c%s "$LOG_FILE")" -gt "$MAX_LOG_SIZE" ]
+    rotate_log
+    [ "$(stat -c%s "$LOG_FILE")" -lt "$MAX_LOG_SIZE" ]
+}
+
 @test "rotate_log 对小日志不做任何改动" {
     printf 'a\nb\n' > "$LOG_FILE"
     printf 'c\nd\n' > "$CRON_LOG_FILE"

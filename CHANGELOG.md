@@ -1,5 +1,29 @@
 # 更新日志
 
+## v2.2.1（2026-10-29）—— 真机运行时修复
+
+### 修复（均在 Ubuntu 26.04 / ufw 0.36.2 实机复现）
+- **规则删除语法错误（最严重）**：`ufw delete <port>/<proto>` 在 ufw 0.36 无效（输出用法、规则仍在），导致动态端口回收、白名单删除、`uninstall --purge` 全部失效。现统一生成 `delete allow ...`。
+- **portless / any 规则无法识别**：`ufw status` 把无端口协议显示为 `Anywhere/esp`、any 显示为裸 `Anywhere`，旧解析只认 `22/tcp` 形式，导致白名单每 5 分钟重复添加同类规则、规则无限膨胀。现正确归一到 `-/esp`、`-/any`。
+- **显式 `/v4` 规则重复添加**：`ufw status` 不输出 `(v4)` 标记，`443/tcp/v4` 永远匹配不到已有规则；新增 `ufw_rule_exists` 的 `/v4` 回退匹配。
+- **双栈 purge 二次删除报错**：同时存在 `K` 与 `K/v6` 两条 status 记录时，删除 `K` 已连带删除 v6，现跳过 `/v6` 变体。
+- **icmp/协议号/sctp 不被 ufw 支持**：`ufw 0.36` 仅支持 tcp/udp/ipv6/esp/ah/igmp/gre/vrrp；此前 `icmp` 白名单每轮报错。现用 `ufw --dry-run` 探测协议能力，不支持时明确提示并跳过（ICMP 由 ufw `before.rules` 默认放行）。
+- **dry-run 改写 ports.state**：`port-check --dry-run` 会重写状态文件，造成规则与 state 脱节、孤儿规则永不回收；现 dry-run 不写状态。
+- **放行失败仍写入 state**：失败端口进入 state 后下一轮不再重试；现仅记录已真实放行（或已存在）的动态端口。
+- **`detect_ssh_ports` 在 `set -e/pipefail` 下崩溃**：无 sshd 监听且无 `Port` 配置时，`grep` 无匹配使管道返回 1，直接终止脚本；已显式兜底，恒回退 22。
+- **日志轮转对单行超长日志无效**：`tail -n 500` 保留单条 1MB+ 行后仍超限；新增按字节兜底截断（cron.log 同样生效）。
+- **首次初始化覆盖已有白名单**：`init_ufw` 无条件重新生成白名单，会冲掉刚迁移的 v1 配置；现仅在文件不存在时生成。
+- **cron/快捷命令硬编码 `/opt`**：自定义 `AUTO_FW_HOME` 部署时 cron 指向错误路径；现统一使用 `${SCRIPT_DIR}`。追加 crontab 前补换行，避免与上一行粘连。
+- **dry-run 仍变更服务**：`svc_exec`（systemctl/service）未受 dry-run 约束，`uninstall --purge --dry-run` 会真的停用 fail2ban；现加 dry-run 日志短路。
+- **`unban` 非幂等**：对未封禁 IP 返回非 0；现幂等返回 0。
+- **TUI Dry-run 演练混入历史日志**：改为只显示本次演练新增的 `[DRYRUN]` 行。
+
+### 测试
+- 新增 `tests/runtime_compat.bats`（11 项）覆盖上述格式/语法/状态一致性回归。
+- 新增 `tests/verify-runtime.sh`：真机运行时场景（真实监听端口动态放行/回收、白名单幂等、fail2ban 联动与真实封禁、并发锁、日志轮转、dry-run、幂等重装、purge）共 61 项。
+- `tests/verify-full.sh` 移除硬编码 SSH 端口 5522，改为按本机自适应；`tests/run.sh` 增加 SC2329 豁免说明。
+- Ubuntu 26.04 / WSL2 实测：shellcheck 0 findings、bats 全绿、方案2 60/60、方案3 61/61。
+
 ## v2.2.0（2026-09-25）
 
 ### 修复

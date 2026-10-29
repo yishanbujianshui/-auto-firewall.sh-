@@ -9,7 +9,7 @@ set -euo pipefail
 
 #---- 全局配置 ----------------------------------------------------------------
 # 版本与 schema（spec §4.1）
-readonly SCRIPT_VERSION="2.2.0"
+readonly SCRIPT_VERSION="2.2.1"
 readonly STATE_SCHEMA_VERSION=2
 # 路径基址: 支持 AUTO_FW_HOME 环境变量覆盖（bats 测试隔离用, spec §2.6 GAP-A）
 SCRIPT_DIR="${AUTO_FW_HOME:-/opt/auto-firewall}"
@@ -71,8 +71,14 @@ run_cmd() {
 }
 ufw_exec()      { run_cmd ufw "$@"; }
 fail2ban_exec() { run_cmd fail2ban-client "$@"; }
-# 服务管理封装（systemctl 优先, 回退 service）
-svc_exec()      { systemctl "$@" 2>&1 || service "$@" 2>&1 || true; }
+# 服务管理封装（systemctl 优先, 回退 service）; 变更类操作同样遵守 dry-run
+svc_exec() {
+    if [[ "${DRY_RUN:-0}" == "1" ]]; then
+        _log "[DRYRUN] service $*"
+        return 0
+    fi
+    systemctl "$@" 2>&1 || service "$@" 2>&1 || true
+}
 
 #---- 端口描述符模型 v2（spec §2）----------------------------------------------
 # 行语法: <port-spec>/<proto>[/<addr>], 如 22/tcp, 8000:8100/tcp, 443/tcp/v6,
@@ -152,6 +158,10 @@ build_ufw_args() {
         if [[ "$pf" == "$pt" ]]; then port_spec="$pf"; else port_spec="${pf}:${pt}"; fi
     fi
     echo "$action"
+    # ufw 0.36 的 delete 必须携带动作词: `ufw delete 22/tcp` 无效, `ufw delete allow 22/tcp` 才生效
+    if [[ "$action" == "delete" ]]; then
+        echo "allow"
+    fi
     case "$proto" in
         any)
             echo "from"; echo "any"; echo "to"; echo "any" ;;
@@ -218,10 +228,11 @@ parse_scan_line() {
 
 # 采集监听原始行（经 ss_probe/netstat_probe 封装, 便于测试桩入）
 ss_listen_raw() {
+    # -p 用于提取进程名（白名单注释/SSH 探测）; 非 root 时仅显示自有进程, 不影响解析
     if command -v ss &>/dev/null; then
-        { ss_probe -tln; ss_probe -uln; }
+        { ss_probe -tlnp; ss_probe -ulnp; }
     elif command -v netstat &>/dev/null; then
-        netstat_probe -tuln
+        netstat_probe -tulnp
     else
         return 1
     fi
@@ -242,7 +253,8 @@ detect_ssh_ports() {
         parsed="$(parse_scan_line "$line")" || continue
         ports="${ports} ${parsed%%|*}"
     done <<<"$raw"
-    ports="$(printf '%s' "$ports" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -un | tr '\n' ' ')"
+    # pipefail 下 grep 无匹配会返回 1, 必须显式兜底, 否则 set -e 直接终止（无 sshd 的机器）
+    ports="$(printf '%s' "$ports" | tr ' ' '\n' | grep -E '^[0-9]+$' | sort -un | tr '\n' ' ' || true)"
     [[ -z "${ports// /}" ]] && ports="22"
     printf '%s\n' "${ports% }"
 }
@@ -311,6 +323,13 @@ rotate_log() {
         size=$(stat -c%s "$f" 2>/dev/null || stat -f%z "$f" 2>/dev/null || echo 0)
         if [[ $size -gt $MAX_LOG_SIZE ]]; then
             tail -n "$LOG_RETAIN_LINES" "$f" > "${f}.tmp"
+            # 单行超长日志（如整段 JSON/异常堆栈）按行截断后仍可能超限, 再按字节兜底
+            if [[ $(stat -c%s "${f}.tmp" 2>/dev/null || echo 0) -gt $MAX_LOG_SIZE ]]; then
+                tail -c $((MAX_LOG_SIZE / 2)) "${f}.tmp" > "${f}.tmp2" || true
+                if [[ -s "${f}.tmp2" ]]; then
+                    mv "${f}.tmp2" "${f}.tmp"
+                fi
+            fi
             mv "${f}.tmp" "$f"
             _info "日志已轮转（超过 1MB，已截断至最后 ${LOG_RETAIN_LINES} 行）: $(basename "$f")"
         fi
@@ -713,8 +732,13 @@ unban_ip() {
     valid_ip_spec "${ip%%/*}" || { _err "非法 IP/CIDR: $ip"; return 1; }
     acquire_lock
     fail2ban_exec set sshd unbanip "$ip" >/dev/null 2>&1 || true
-    ufw_exec delete deny from "$ip" to any comment "auto-firewall-manual" \
-        && _info "已解封: $ip"
+    # 幂等: 未找到手动封禁规则也视为成功, 避免 unban 未封禁 IP 时报错
+    if ufw_exec delete deny from "$ip" to any comment "auto-firewall-manual" >/dev/null 2>&1; then
+        _info "已解封: $ip"
+    else
+        _info "未找到该 IP 的手动封禁规则: $ip"
+    fi
+    return 0
 }
 
 show_version() {
@@ -765,6 +789,11 @@ purge_firewall() {
             auto-firewall|auto-firewall-whitelist|auto-firewall-manual) : ;;
             *) continue ;;
         esac
+        # 双栈规则同时有 "K" 与 "K/v6" 两条 status 记录; 删除 K 时 ufw 已一并删除 v6,
+        # 跳过 /v6 变体避免二次删除报错
+        if [[ "$k" == */v6 && -n "${UFW_EXIST[${k%/v6}]:-}" ]]; then
+            continue
+        fi
         if [[ " ${sshp} " == *" ${k%%/*} "* && "$FORCE_SSH" != "1" ]]; then
             _info "保留 SSH 规则: $k（确需删除请加 --force-ssh）"
             continue
@@ -805,8 +834,8 @@ uninstall() {
         fi
     fi
     run_cmd rm -f "${R}/etc/profile.d/auto-firewall.sh"
-    if [[ -f "${R}/etc/crontab" ]]; then
-        run_cmd sed -i '/# BEGIN auto-firewall/,/# END auto-firewall/d' "${R}/etc/crontab"
+    if [[ -f "${R}${CRONTAB_FILE}" ]]; then
+        run_cmd sed -i '/# BEGIN auto-firewall/,/# END auto-firewall/d' "${R}${CRONTAB_FILE}"
     fi
     run_cmd rm -rf "${SCRIPT_DIR:?}"
     _info "卸载完成。提示: 系统级 ufw/fail2ban 仍在生效（封禁未停止）, 如需一并停用请改用 uninstall --purge（GAP-D）"
@@ -1041,8 +1070,11 @@ tui_run() {
         7) tui_ban ;;
         8) out="$(tail -n 25 "$LOG_FILE" 2>/dev/null || echo '(无日志)')"
            tui_msg "实时日志（最近25行）" "$out" ;;
-        9) out="$(DRY_RUN=1 port_check 2>&1)" || true
-           out="$(grep '\[DRYRUN\]' "$LOG_FILE" | tail -25)"
+        9) local before
+           before=$(wc -l < "$LOG_FILE" 2>/dev/null || echo 0)
+           out="$(DRY_RUN=1 port_check 2>&1)" || true
+           # 只展示本次演练新增的 [DRYRUN] 行（历史日志中的旧演练不应混入）
+           out="$(tail -n "+$((before + 1))" "$LOG_FILE" 2>/dev/null | grep '\[DRYRUN\]' | tail -25 || true)"
            if [[ -z "$out" ]]; then out='(无待执行动作)'; fi
            tui_msg "Dry-run 将要执行的动作（最近25条）" "$out" ;;
         a) out="$(show_version 2>&1)"; tui_msg "版本信息" "$out" ;;
@@ -1334,8 +1366,12 @@ init_ufw() {
     # Docker 兼容性修复
     fix_docker_ufw
 
-    # 生成白名单（扫描当前监听端口）
-    generate_whitelist
+    # 生成白名单: 已有配置（含刚迁移的 v1 配置）不得被覆盖, 只在缺失时生成
+    if [[ -f "$WHITELIST_FILE" ]]; then
+        _info "白名单已存在，保留现有配置（不重新生成）: $WHITELIST_FILE"
+    else
+        generate_whitelist
+    fi
 
     # 放行所有白名单端口
     _info "正在放行白名单端口..."
@@ -1420,7 +1456,7 @@ ${MARKER_END}"
 # 基于当前监听生成默认白名单（均为动态 tcp/udp 单端口）
 generate_whitelist() {
     _info "正在生成初始端口白名单..."
-    local keys k base port proto svc raw
+    local keys k base port proto svc raw sp
     keys="$(scan_current_keys || true)"
     raw="$(ss_listen_raw 2>/dev/null || true)"
     {
@@ -1433,7 +1469,7 @@ generate_whitelist() {
 #   22/tcp              # SSH（双栈）
 #   8000:8100/tcp       # 端口区间
 #   443/tcp/v6          # 仅 IPv6
-#   icmp 或 -/esp       # 无端口协议
+#   -/esp 或 -/ah       # 无端口协议（ufw 不支持 icmp/sctp/协议号）
 #
 # 白名单端口始终放行且不受自动回收影响。
 GWHDR
@@ -1449,6 +1485,11 @@ GWHDR
             svc="$(awk -v p=":${port} " 'index($0,p){ if (match($0,/\(\("[^"]+"/)){s=substr($0,RSTART+3);sub(/".*/,"",s);print s;exit} }' <<<"$raw")"
             [[ -z "$svc" ]] && svc="auto-detected"
             echo "${k}  # ${svc}"
+        done
+        # SSH 端口无论当前是否在监听都必须留在白名单, 避免 ss 暂时不可用导致失联
+        for sp in $(detect_ssh_ports); do
+            printf '%s\n' "$keys" | grep -qxF "${sp}/tcp" && continue
+            echo "${sp}/tcp  # SSH (auto-detect)"
         done
         echo ""
         echo "# --- 用户自定义端口（可在此添加）---"
@@ -1472,8 +1513,45 @@ read_whitelist() {
 #     声明与空赋值分开, `declare -A X=()` 会丢失关联属性(bash 怪癖)
 declare -gA UFW_EXIST
 declare -gA UFW_MARKER
+declare -gA UFW_PROTO_CACHE
 UFW_EXIST=()
 UFW_MARKER=()
+UFW_PROTO_CACHE=()
+
+# 取 canon key 的协议（用于端口无关协议的 ufw 能力判断）
+key_proto() {
+    local parsed proto
+    parsed="$(parse_descriptor "${1:-}")" || return 1
+    IFS='|' read -r _ _ proto _ <<<"$parsed"
+    printf '%s\n' "$proto"
+}
+
+# 当前 ufw 是否原生支持该协议（ufw 0.36 支持 tcp/udp/ipv6/esp/ah/igmp/gre/vrrp;
+# icmp/sctp/协议号不支持）。用 --dry-run 做无副作用探测并缓存结果。
+ufw_proto_supported() {
+    local proto="${1:-}"
+    [[ -n "$proto" ]] || return 1
+    case "${UFW_PROTO_CACHE[$proto]:-}" in
+        1) return 0 ;;
+        0) return 1 ;;
+    esac
+    if ufw --dry-run allow proto "$proto" from any to any >/dev/null 2>&1; then
+        UFW_PROTO_CACHE["$proto"]=1
+        return 0
+    fi
+    UFW_PROTO_CACHE["$proto"]=0
+    return 1
+}
+
+# 规则是否已存在: /v4 在 ufw status 中不带 (v4) 标记, 回退为无族 key 匹配
+ufw_rule_exists() {
+    local key="${1:-}"
+    [[ -n "${UFW_EXIST[$key]:-}" ]] && return 0
+    if [[ "$key" == */v4 ]]; then
+        [[ -n "${UFW_EXIST[${key%/v4}]:-}" ]] && return 0
+    fi
+    return 1
+}
 
 # 解析 ufw status 输出填充 EXIST/MARKER; 只读操作不走 run_cmd(dry-run 仍需真实状态)
 refresh_ufw_table() {
@@ -1499,6 +1577,12 @@ refresh_ufw_table() {
             key="${tok}${famtok}"
         elif [[ "$tok" =~ ^(icmp|esp|ah|gre|sctp|any)$ ]]; then
             key="-/${tok}"
+        elif [[ "$tok" =~ ^Anywhere/(.+)$ ]]; then
+            # portless 协议在 status 中显示为 "Anywhere/esp"；双栈规则 v4/v6 两行同归一
+            key="-/${BASH_REMATCH[1]}"
+        elif [[ "$tok" == "Anywhere" ]]; then
+            # `ufw allow from any to any`（any 协议）显示为裸 "Anywhere"，canon key 为 -/any
+            key="-"/"any"
         fi
         [[ -z "$key" ]] && continue
         UFW_EXIST["$key"]=1
@@ -1537,11 +1621,19 @@ apply_whitelist() {
         return 0
     fi
     refresh_ufw_table
-    local entry err=0
+    local entry err=0 proto
     local -a args
     while IFS= read -r entry; do
         [[ -z "$entry" ]] && continue
-        [[ -n "${UFW_EXIST[$entry]:-}" ]] && continue
+        ufw_rule_exists "$entry" && continue
+        proto="$(key_proto "$entry" 2>/dev/null || true)"
+        # 端口无关协议先做 ufw 能力探测: ufw 0.36 不支持 icmp/sctp/协议号
+        if [[ -n "$proto" && "$proto" != tcp && "$proto" != udp && "$proto" != any ]]; then
+            if ! ufw_proto_supported "$proto"; then
+                _info "跳过白名单 ${entry}: 当前 ufw 不支持协议 ${proto}（ICMP 已由 ufw before.rules 默认放行）"
+                continue
+            fi
+        fi
         mapfile -t args < <(build_ufw_args "$entry" allow)
         if (( ${#args[@]} == 0 )); then
             _err "非法白名单条目: ${entry}"; err=1; continue
@@ -1576,6 +1668,7 @@ port_check() {
     # 3. 规则表缓存 + 差分执行（尽力而为, 结束汇总退出, spec §2.5）
     refresh_ufw_table
     local actions line op key err=0 sshp
+    local -A added_ok=()
     sshp="$(detect_ssh_ports)"
     actions="$(compute_port_actions "$(echo "$cur" | tr '\n' ' ')" "$prev" "$(echo "$wl" | tr '\n' ' ')" "$sshp")"
     local -a args
@@ -1587,9 +1680,10 @@ port_check() {
             _err "非法 key: ${key}"; err=1; continue
         fi
         if [[ "$op" == "ADD" ]]; then
-            [[ -n "${UFW_EXIST[$key]:-}" ]] && continue
+            ufw_rule_exists "$key" && continue
             if ufw_exec "${args[@]}" comment "auto-firewall" >/dev/null 2>&1; then
                 _info "自动放行: ${key}"
+                added_ok["$key"]=1
             else
                 _err "放行失败: ${key}"; err=1
             fi
@@ -1605,13 +1699,20 @@ port_check() {
         fi
     done <<<"$actions"
 
-    # 4. 更新状态文件: 仅记录非白名单动态端口
-    local k dyn=""
-    for k in $cur; do
-        if [[ -n "$wl" ]] && echo "$wl" | grep -qxF "$k"; then continue; fi
-        dyn="${dyn}${k}"$'\n'
-    done
-    { echo "# schema-version: 2"; printf '%s' "$dyn" | sort -u | sed '/^$/d'; } > "$STATE_FILE"
+    # 4. 更新状态文件: 仅记录非白名单且已真实放行的动态端口
+    #    dry-run 不改状态（否则会造成规则与 state 脱节, 孤儿规则永不回收）;
+    #    放行失败的端口不写入 state, 下一轮会重试
+    if [[ "${DRY_RUN:-0}" == "1" ]]; then
+        _info "[DRYRUN] 跳过 ports.state 更新"
+    else
+        local k dyn=""
+        for k in $cur; do
+            if [[ -n "$wl" ]] && echo "$wl" | grep -qxF "$k"; then continue; fi
+            [[ -n "${added_ok[$k]:-}" ]] || ufw_rule_exists "$k" || continue
+            dyn="${dyn}${k}"$'\n'
+        done
+        { echo "# schema-version: 2"; printf '%s' "$dyn" | sort -u | sed '/^$/d'; } > "$STATE_FILE"
+    fi
 
     if (( err )); then
         _err "端口扫描部分失败。"
@@ -1681,6 +1782,8 @@ cleanup() {
 #---- Cron 部署 ---------------------------------------------------------------
 # profile.d 快捷命令目标（测试 seam, spec §6.2）
 SHORTCUT_TARGET="${AUTO_FW_SHORTCUT_TARGET:-/etc/profile.d/auto-firewall.sh}"
+# 系统 crontab 路径（测试 seam）
+CRONTAB_FILE="${AUTO_FW_CRONTAB:-/etc/crontab}"
 
 # 写入 x/X 命令行快捷命令（替代 sudo bash auto-firewall.sh）, 幂等区块
 install_shortcut() {
@@ -1688,17 +1791,18 @@ install_shortcut() {
     if [[ -f "$SHORTCUT_TARGET" ]]; then
         sed -i '/# BEGIN auto-firewall-shortcut/,/# END auto-firewall-shortcut/d' "$SHORTCUT_TARGET"
     fi
-    cat >> "$SHORTCUT_TARGET" <<'SC'
+    # 路径取自安装目录（支持非 /opt 部署）, 不再硬编码
+    cat >> "$SHORTCUT_TARGET" <<SC
 # BEGIN auto-firewall-shortcut
 afw_shortcut() {
-    if [[ $# -eq 0 ]]; then
-        sudo bash /opt/auto-firewall/auto-firewall.sh menu
+    if [[ \$# -eq 0 ]]; then
+        sudo bash "${SCRIPT_DIR}/auto-firewall.sh" menu
     else
-        sudo bash /opt/auto-firewall/auto-firewall.sh "$@"
+        sudo bash "${SCRIPT_DIR}/auto-firewall.sh" "\$@"
     fi
 }
-x() { afw_shortcut "$@"; }
-X() { afw_shortcut "$@"; }
+x() { afw_shortcut "\$@"; }
+X() { afw_shortcut "\$@"; }
 # END auto-firewall-shortcut
 SC
     chmod 644 "$SHORTCUT_TARGET"
@@ -1709,30 +1813,29 @@ install_cron() {
     _info "正在配置 Crontab 定时任务..."
 
     local cron_jobs
-    # 使用 read -r -d '' 读取多行字符串
-    IFS= read -r -d '' cron_jobs <<'CRONEOF' || true
+    # 使用 read -r -d '' 读取多行字符串; 路径取自安装目录（支持非 /opt 部署）
+    IFS= read -r -d '' cron_jobs <<CRONEOF || true
 # BEGIN auto-firewall - 请勿手动编辑此区块
-*/5 * * * *  root /opt/auto-firewall/auto-firewall.sh port-check     >> /opt/auto-firewall/logs/cron.log 2>&1
-*/15 * * * * root /opt/auto-firewall/auto-firewall.sh fail2ban-check >> /opt/auto-firewall/logs/cron.log 2>&1
-0   * * * *  root /opt/auto-firewall/auto-firewall.sh cleanup        >> /opt/auto-firewall/logs/cron.log 2>&1
+*/5 * * * *  root ${SCRIPT_DIR}/auto-firewall.sh port-check     >> ${LOG_DIR}/cron.log 2>&1
+*/15 * * * * root ${SCRIPT_DIR}/auto-firewall.sh fail2ban-check >> ${LOG_DIR}/cron.log 2>&1
+0   * * * *  root ${SCRIPT_DIR}/auto-firewall.sh cleanup        >> ${LOG_DIR}/cron.log 2>&1
 # END auto-firewall
 CRONEOF
 
-    # 移除旧的 cron 条目
-    if [[ -f /etc/crontab ]]; then
-        sed -i '/# BEGIN auto-firewall/,/# END auto-firewall/d' /etc/crontab
-        echo "$cron_jobs" >> /etc/crontab
+    # 移除旧的 cron 条目; 追加前确保文件以换行结尾, 避免与上一行粘连
+    if [[ -f "$CRONTAB_FILE" ]]; then
+        sed -i '/# BEGIN auto-firewall/,/# END auto-firewall/d' "$CRONTAB_FILE"
     else
-        echo "$cron_jobs" > /etc/crontab
+        : > "$CRONTAB_FILE"
     fi
+    if [[ -s "$CRONTAB_FILE" && -n "$(tail -c 1 "$CRONTAB_FILE")" ]]; then
+        printf '\n' >> "$CRONTAB_FILE"
+    fi
+    printf '%s\n' "$cron_jobs" >> "$CRONTAB_FILE"
 
     # 确保 cron 服务运行（Debian 可能默认未启用）
-    if command -v systemctl &>/dev/null; then
-        systemctl enable cron &>/dev/null || systemctl enable cronie &>/dev/null || true
-        systemctl start cron  &>/dev/null || systemctl start cronie  &>/dev/null || true
-    elif command -v service &>/dev/null; then
-        service cron start &>/dev/null || true
-    fi
+    svc_exec enable cron
+    svc_exec start cron
 
     _info "Cron 定时任务已配置:"
     _info "  - 端口检测:     每5分钟"
@@ -1772,7 +1875,9 @@ show_help() {
 
 端口白名单 v2 语法(保留 v1 兼容):
   22/tcp            双栈 SSH    | 8000:8100/tcp  端口区间
-  443/tcp/v6        仅 IPv6     | icmp 或 -/esp  无端口协议
+  443/tcp/v6        仅 IPv6     | -/esp 等       无端口协议
+  注: ufw 仅支持 tcp/udp/esp/ah/gre 等; icmp/sctp/协议号条目会被跳过
+      （Ubuntu/Debian 的 ufw before.rules 默认已放行 ICMP）
 SSH 保护: 自动探测 sshd 监听端口(sshd_config Port + 实际监听), 非写死 22
 
 文件: /opt/auto-firewall/{auto-firewall.sh,port-whitelist.conf,ip-whitelist.conf,ports.state,.schema_version,backup/,logs/}

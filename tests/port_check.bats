@@ -80,7 +80,7 @@ teardown() {
 
 @test "port_check 回收失效且带 auto-firewall 标记的 9000/tcp" {
     port_check
-    grep -q "delete 9000/tcp" "$UFW_LOG"
+    grep -q "delete allow 9000/tcp" "$UFW_LOG"
 }
 
 @test "port_check 不动 manual(无标记)规则 3306" {
@@ -112,6 +112,11 @@ teardown() {
 @test "dry-run: 只记录不真正调用 ufw 变更" {
     DRY_RUN=1
     port_check
-    [ ! -s "$UFW_LOG" ]
+    # 只允许协议能力探测（--dry-run）出现, 不得有真正的 allow/delete 调用
+    run grep -v '^ufw --dry-run' "$UFW_LOG"
+    [ -z "$output" ]
     grep -q '\[DRYRUN\] ufw allow 80/tcp' "$LOG_FILE"
+    # dry-run 不得改写 state
+    run grep -qx "80/tcp" "$STATE_FILE"
+    [ -z "$output" ]
 }

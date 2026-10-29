@@ -18,7 +18,7 @@ teardown() { rm -rf "$AUTO_FW_HOME"; }
     install_shortcut
     grep -q 'x() { afw_shortcut "$@"; }' "$AUTO_FW_SHORTCUT_TARGET"
     grep -q 'X() { afw_shortcut "$@"; }' "$AUTO_FW_SHORTCUT_TARGET"
-    grep -q 'auto-firewall.sh menu' "$AUTO_FW_SHORTCUT_TARGET"
+    grep -q 'auto-firewall.sh" menu' "$AUTO_FW_SHORTCUT_TARGET"
 }
 
 @test "install_shortcut 幂等: 重复执行不叠加区块" {

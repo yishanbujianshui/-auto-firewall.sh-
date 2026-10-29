@@ -60,9 +60,14 @@ join() { printf '%s' "${output//$'\n'/ }"; }
   [ "$(join)" = "allow 53/udp" ]
 }
 
-@test "delete 动作透传" {
+@test "delete 动作必须携带 allow（ufw 0.36 语法）" {
   run build_ufw_args "22/tcp" delete
-  [ "$(join)" = "delete 22/tcp" ]
+  [ "$(join)" = "delete allow 22/tcp" ]
+}
+
+@test "delete 无端口协议同样携带 allow" {
+  run build_ufw_args "-/esp" delete
+  [ "$(join)" = "delete allow proto esp from any to any" ]
 }
 
 @test "非法 key 返回非0" {
